@@ -12,7 +12,7 @@ Inspired by [SockTail](https://github.com/Yeeb1/SockTail).
 - **Ctrl+Alt+Del Injection** - Sends the Secure Attention Sequence from Session 0 via `sas.dll!SendSAS`
 - **Bidirectional Clipboard Sync** - Latin-1 clipboard synchronization between VNC client and target host
 - **Build-Time Configuration Embedding** - Auth key, VNC password, listen port, and control URL are injected at compile time via LDFLAGS; the resulting binary requires no configuration files at runtime
-- **Auth Key Obfuscation** - Tailscale auth key is XOR-obfuscated at build time to prevent plaintext credential exposure in the binary
+- **Auth Key Obfuscation** - Tailscale auth key is AES-256-CTR encrypted at build time (key embedded in binary; removes plaintext from static analysis but is NOT a defense against reverse engineering — use short-lived restricted keys)
 
 ## Architecture
 
