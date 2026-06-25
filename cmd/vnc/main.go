@@ -3,10 +3,12 @@
 package main
 
 import (
+	"encoding/hex"
 	"io"
 	"log"
 	"net"
 	"os"
+	"tailvnc/pkg/authtoken"
 	"tailvnc/pkg/deobfuscator"
 	"tailvnc/pkg/secrets"
 	"tailvnc/pkg/utils"
@@ -77,6 +79,18 @@ func runAgent(port string) {
 		log.Fatalf("[agent] listen: %v", err)
 	}
 	defer ln.Close()
+
+	// SEC-2: if spawned by the service, require the one-time IPC token on this
+	// loopback listener so a non-authorized local process cannot seize the
+	// desktop without the VNC password.
+	if tokHex := os.Getenv("TAILVNC_AGENT_TOKEN"); tokHex != "" {
+		tok, err := hex.DecodeString(tokHex)
+		if err != nil || len(tok) == 0 {
+			log.Fatalf("[agent] invalid TAILVNC_AGENT_TOKEN: %v", err)
+		}
+		ln = authtoken.NewListener(ln, tok)
+		log.Printf("[agent] IPC token auth enabled")
+	}
 
 	srv := &vnc.Server{}
 	srv.RunLocal(ln)

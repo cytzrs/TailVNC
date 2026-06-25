@@ -277,7 +277,7 @@ func (s *Server) RunAsService(ln net.Listener) {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go proxyToAgent(conn, agentLocalPort)
+		go proxyToAgent(conn, agentLocalPort, sm.currentToken())
 	}
 }
 

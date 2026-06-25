@@ -3,6 +3,7 @@
 package vnc
 
 import (
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"tailvnc/pkg/authtoken"
 )
 
 const (
@@ -88,36 +90,31 @@ func getSystemTokenForSession(sessionID uint32) (windows.Token, error) {
 }
 
 // spawnAgentInSession launches the current executable with "--agent <port>" in
-// the given Windows session using a SYSTEM token placed in that session.
-func spawnAgentInSession(sessionID uint32, port string) (windows.Handle, error) {
+// the given Windows session using a SYSTEM token placed in that session. It
+// also generates a fresh one-time IPC token (SEC-2) and passes it to the agent
+// via its environment block; the agent's loopback listener then refuses any
+// connection that does not present it.
+func spawnAgentInSession(sessionID uint32, port string) (windows.Handle, []byte, error) {
 	token, err := getSystemTokenForSession(sessionID)
 	if err != nil {
-		return 0, fmt.Errorf("cannot get SYSTEM token for session %d: %w", sessionID, err)
+		return 0, nil, fmt.Errorf("cannot get SYSTEM token for session %d: %w", sessionID, err)
 	}
 	defer token.Close()
 
-	// Build an environment block (best-effort; nil falls back to inheriting
-	// the service's environment which is sufficient for screen capture and
-	// input injection).
-	var envBlock uintptr
-	r, _, _ := procCreateEnvironmentBlock.Call(
-		uintptr(unsafe.Pointer(&envBlock)),
-		uintptr(token),
-		0,
-	)
-	if r != 0 {
-		defer procDestroyEnvironmentBlock.Call(envBlock)
+	ipcToken, err := authtoken.Generate(32)
+	if err != nil {
+		return 0, nil, fmt.Errorf("authtoken.Generate: %w", err)
 	}
 
 	exePath, err := os.Executable()
 	if err != nil {
-		return 0, fmt.Errorf("Executable: %w", err)
+		return 0, nil, fmt.Errorf("Executable: %w", err)
 	}
 
 	cmdLine := `"` + exePath + `" --agent ` + port
 	cmdLineW, err := windows.UTF16PtrFromString(cmdLine)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	desktop, _ := windows.UTF16PtrFromString(`WinSta0\Default`)
@@ -129,10 +126,9 @@ func spawnAgentInSession(sessionID uint32, port string) (windows.Handle, error) 
 	}
 	var pi windows.ProcessInformation
 
-	var envPtr *uint16
-	if envBlock != 0 {
-		envPtr = (*uint16)(unsafe.Pointer(envBlock))
-	}
+	// Minimal UTF-16 env block carrying only the IPC token. The agent (screen
+	// capture / input / clipboard) does not need the parent service's env.
+	envPtr := buildAgentEnv(ipcToken)
 
 	err = windows.CreateProcessAsUser(
 		token, nil, cmdLineW,
@@ -141,21 +137,37 @@ func spawnAgentInSession(sessionID uint32, port string) (windows.Handle, error) 
 		envPtr, nil, &si, &pi,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("CreateProcessAsUser: %w", err)
+		return 0, nil, fmt.Errorf("CreateProcessAsUser: %w", err)
 	}
 	windows.CloseHandle(pi.Thread)
-	log.Printf("[agent] spawned PID=%d in session %d on port %s (token=SYSTEM)", pi.ProcessId, sessionID, port)
-	return pi.Process, nil
+	log.Printf("[agent] spawned PID=%d in session %d on port %s (token=SYSTEM, ipc-auth=on)", pi.ProcessId, sessionID, port)
+	return pi.Process, ipcToken, nil
+}
+
+// buildAgentEnv returns a Windows double-null-terminated UTF-16 environment
+// block containing TAILVNC_AGENT_TOKEN=<hex(token)>. The agent reads it via
+// os.Getenv. Built manually (not CreateEnvironmentBlock) so the token is the
+// only record and nothing else is inherited.
+func buildAgentEnv(token []byte) *uint16 {
+	rec := "TAILVNC_AGENT_TOKEN=" + hex.EncodeToString(token)
+	var buf []uint16
+	for _, r := range rec {
+		buf = append(buf, uint16(r)) // ASCII-only record (hex chars + '=')
+	}
+	buf = append(buf, 0) // record terminator
+	buf = append(buf, 0) // block terminator
+	return &buf[0]
 }
 
 // sessionManager monitors the active console session and keeps an agent process
 // running in it.  On session change (logoff / new logon), it kills the old
 // agent and spawns a fresh one.
 type sessionManager struct {
-	port      string
-	mu        sync.Mutex
-	agentProc windows.Handle
-	sessionID uint32
+	port       string
+	mu         sync.Mutex
+	agentProc  windows.Handle
+	agentToken []byte // current one-time IPC token (SEC-2), rotated per spawn
+	sessionID  uint32
 }
 
 func newSessionManager(port string) *sessionManager {
@@ -185,17 +197,26 @@ func (m *sessionManager) run() {
 		}
 
 		if m.agentProc == 0 && sid != 0xFFFFFFFF {
-			h, err := spawnAgentInSession(sid, m.port)
+			h, tok, err := spawnAgentInSession(sid, m.port)
 			if err != nil {
 				log.Printf("[session] spawn agent: %v", err)
 			} else {
 				m.agentProc = h
+				m.agentToken = tok
 			}
 		}
 		m.mu.Unlock()
 
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// currentToken returns the active IPC token (or nil if no agent is running),
+// copied under the lock so the caller can hand it to a proxy goroutine.
+func (m *sessionManager) currentToken() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.agentToken
 }
 
 func (m *sessionManager) killAgent() {

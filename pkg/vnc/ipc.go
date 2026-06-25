@@ -12,7 +12,9 @@ import (
 // proxyToAgent connects to the local agent VNC server and bidirectionally
 // proxies bytes between the remote VNC client and the agent.
 // Retries for up to 10 seconds to give the agent time to start.
-func proxyToAgent(client net.Conn, port string) {
+// If token is non-empty it is written first (SEC-2): the agent's loopback
+// listener drops connections that do not present it.
+func proxyToAgent(client net.Conn, port string, token []byte) {
 	defer client.Close()
 
 	addr := "127.0.0.1:" + port
@@ -31,6 +33,16 @@ func proxyToAgent(client net.Conn, port string) {
 		return
 	}
 	defer agentConn.Close()
+
+	// SEC-2: present the one-time token before any RFB bytes flow.
+	if len(token) > 0 {
+		_ = agentConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := agentConn.Write(token); err != nil {
+			log.Printf("[proxy] %s: token write failed: %v", client.RemoteAddr(), err)
+			return
+		}
+		_ = agentConn.SetWriteDeadline(time.Time{})
+	}
 
 	log.Printf("[proxy] %s ↔ agent:%s", client.RemoteAddr(), port)
 
