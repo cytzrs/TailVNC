@@ -2,8 +2,10 @@ package rfbcore
 
 import (
 	"bytes"
+	"compress/zlib"
 	"image"
 	"image/color"
+	"io"
 	"testing"
 )
 
@@ -141,5 +143,68 @@ func TestEncodeRectPixelsFastPathLittleEndian(t *testing.T) {
 	want := []byte{0, 0, 255, 0, 0, 255, 0, 0}
 	if !bytes.Equal(out, want) {
 		t.Fatalf("out=%v, want %v", out, want)
+	}
+}
+
+func TestZlibCompressRoundTrip(t *testing.T) {
+	src := bytes.Repeat([]byte{0xaa, 0x55, 0x00, 0xff}, 1000)
+	cx, err := ZlibCompress(src)
+	if err != nil {
+		t.Fatalf("ZlibCompress: %v", err)
+	}
+	if len(cx) >= len(src) {
+		t.Logf("warning: compressed (%d) not smaller than src (%d)", len(cx), len(src))
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(cx))
+	if err != nil {
+		t.Fatalf("zlib.NewReader: %v", err)
+	}
+	defer zr.Close()
+	got, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, src) {
+		t.Fatal("round-trip mismatch")
+	}
+}
+
+func TestEncodeDirtyRectRawAndZlib(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	pf := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	r := Rect{X: 0, Y: 0, W: 4, H: 4}
+
+	enc, payload := EncodeDirtyRect(img, r, img.Stride, pf, false)
+	if enc != EncRaw {
+		t.Fatalf("useZlib=false: enc=%d, want EncRaw(%d)", enc, EncRaw)
+	}
+	if len(payload) != 4*4*4 {
+		t.Fatalf("raw payload len=%d, want 64", len(payload))
+	}
+
+	enc2, payload2 := EncodeDirtyRect(img, r, img.Stride, pf, true)
+	if enc2 != EncZlib {
+		t.Fatalf("useZlib=true: enc=%d, want EncZlib(%d)", enc2, EncZlib)
+	}
+	// CORR-1 contract: an encZlib payload must decompress to the raw pixels.
+	zr, _ := zlib.NewReader(bytes.NewReader(payload2))
+	defer zr.Close()
+	round, _ := io.ReadAll(zr)
+	if !bytes.Equal(round, payload) {
+		t.Fatal("CORR-1: encZlib payload must decompress to the raw pixels")
+	}
+}
+
+func TestLatin1RoundTrip(t *testing.T) {
+	// ASCII round-trips losslessly.
+	got := Latin1ToUTF8([]byte{'A', 'Z', 0xc3}) // 0xc3 = Ã
+	if got != "AZÃ" {
+		t.Fatalf("Latin1ToUTF8 = %q", got)
+	}
+	// Non-Latin-1 runes become '?' (FUNC-1 fixes this in M2; M1 preserves behavior).
+	out := UTF8ToLatin1("héllo→x")
+	if !bytes.Contains(out, []byte{'?'}) {
+		t.Fatalf("expected '?' substitution for non-Latin-1, got %v", out)
 	}
 }
