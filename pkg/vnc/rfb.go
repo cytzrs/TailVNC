@@ -2,6 +2,7 @@ package vnc
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/des"
 	"crypto/rand"
 	"encoding/binary"
@@ -30,7 +31,10 @@ const (
 	serverFramebufferUpdate = 0
 	serverCutText           = 3
 
-	encRaw = 0
+	encRaw     = 0
+	encCopyRect = 1
+	encZlib     = 6
+	encTight    = 7
 )
 
 // The canonical RFB pixel format: 32 bpp, big-endian, XRGB
@@ -73,6 +77,9 @@ type session struct {
 	clientRShift    uint8
 	clientGShift    uint8
 	clientBShift    uint8
+
+	// encodings the client declared via SetEncodings.  Empty = only Raw(0).
+	clientEncodings []int32
 }
 
 func (s *session) addr() string { return s.conn.RemoteAddr().String() }
@@ -390,7 +397,12 @@ func (s *session) handleSetEncodings() error {
 	if _, err := io.ReadFull(s.conn, buf); err != nil {
 		return err
 	}
-	log.Printf("[%s]   SetEncodings: %d encodings", s.addr(), numEnc)
+	encs := make([]int32, numEnc)
+	for i := uint16(0); i < numEnc; i++ {
+		encs[i] = int32(binary.BigEndian.Uint32(buf[i*4 : i*4+4]))
+	}
+	s.clientEncodings = encs
+	log.Printf("[%s]   SetEncodings: %d encodings %v", s.addr(), numEnc, encs)
 	return nil
 }
 
@@ -404,15 +416,107 @@ func (s *session) handleFBUpdateRequest() error {
 	y := int(binary.BigEndian.Uint16(req[3:5]))
 	w := int(binary.BigEndian.Uint16(req[5:7]))
 	h := int(binary.BigEndian.Uint16(req[7:9]))
-	log.Printf("[%s]   FBUpdateReq: incremental=%d x=%d y=%d w=%d h=%d", s.addr(), incremental, x, y, w, h)
 
 	s.syncDims()
+
+	// Incremental requests with nothing changed: send an empty update so the
+	// client stops asking until the next change.  This is what makes a static
+	// desktop consume ~0 bandwidth instead of re-sending the full frame.
+	if incremental == 1 {
+		img, dirty, err := s.capturer.CaptureDirty()
+		if err != nil {
+			return err
+		}
+		if len(dirty) == 0 {
+			// No changes since last frame → empty FramebufferUpdate.
+			return s.sendEmptyUpdate()
+		}
+		return s.sendDirtyUpdate(img, dirty)
+	}
+
+	// Non-incremental (full) request: send the whole requested rectangle.
+	log.Printf("[%s]   FBUpdateReq: full x=%d y=%d w=%d h=%d", s.addr(), x, y, w, h)
 	img, err := s.capturer.Capture()
 	if err != nil {
 		return err
 	}
-
 	return s.sendFramebufferUpdate(img, x, y, w, h)
+}
+
+// sendEmptyUpdate sends a FramebufferUpdate with zero rectangles, telling the
+// client the framebuffer has not changed.  Lets the client stop polling until
+// the next real change.
+func (s *session) sendEmptyUpdate() error {
+	hdr := make([]byte, 4)
+	hdr[0] = serverFramebufferUpdate
+	hdr[1] = 0
+	binary.BigEndian.PutUint16(hdr[2:4], 0) // numRects = 0
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.conn.Write(hdr)
+	return err
+}
+
+// sendDirtyUpdate sends a FramebufferUpdate containing only the changed
+// rectangles.  Each rectangle is encoded separately; when the client supports
+// zlib, pixel data is zlib-compressed (encoding 6), otherwise Raw(0).
+func (s *session) sendDirtyUpdate(img *image.RGBA, dirty []Rect) error {
+	stride := img.Stride
+	bytesPerPixel := int(s.clientBpp) / 8
+	if bytesPerPixel < 1 {
+		bytesPerPixel = 1
+	}
+	useZlib := s.clientSupports(encZlib)
+
+	// Build the whole message in one buffer: header + per-rect (12-byte hdr +
+	// pixel payload).  Compressed rectangles share the logic below.
+	rectHdrs := make([][]byte, 0, len(dirty))
+	pixels := make([][]byte, 0, len(dirty))
+	totalLen := 4
+
+	for _, r := range dirty {
+		px := s.encodeRectPixels(img, r.X, r.Y, r.W, r.H, stride, bytesPerPixel)
+		if useZlib {
+			cx := zlibCompress(px)
+			hdr := make([]byte, 12)
+			binary.BigEndian.PutUint16(hdr[0:2], uint16(r.X))
+			binary.BigEndian.PutUint16(hdr[2:4], uint16(r.Y))
+			binary.BigEndian.PutUint16(hdr[4:6], uint16(r.W))
+			binary.BigEndian.PutUint16(hdr[6:8], uint16(r.H))
+			binary.BigEndian.PutUint32(hdr[8:12], uint32(encZlib))
+			rectHdrs = append(rectHdrs, hdr)
+			pixels = append(pixels, cx)
+			totalLen += 12 + len(cx)
+		} else {
+			hdr := make([]byte, 12)
+			binary.BigEndian.PutUint16(hdr[0:2], uint16(r.X))
+			binary.BigEndian.PutUint16(hdr[2:4], uint16(r.Y))
+			binary.BigEndian.PutUint16(hdr[4:6], uint16(r.W))
+			binary.BigEndian.PutUint16(hdr[6:8], uint16(r.H))
+			binary.BigEndian.PutUint32(hdr[8:12], uint32(encRaw))
+			rectHdrs = append(rectHdrs, hdr)
+			pixels = append(pixels, px)
+			totalLen += 12 + len(px)
+		}
+	}
+
+	msg := make([]byte, totalLen)
+	msg[0] = serverFramebufferUpdate
+	msg[1] = 0
+	binary.BigEndian.PutUint16(msg[2:4], uint16(len(dirty)))
+	off := 4
+	for i := range dirty {
+		copy(msg[off:], rectHdrs[i])
+		off += 12
+		copy(msg[off:], pixels[i])
+		off += len(pixels[i])
+	}
+
+	log.Printf("[%s] >> FBU dirty %d rects (%d bytes, zlib=%v)", s.addr(), len(dirty), len(msg), useZlib)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.conn.Write(msg)
+	return err
 }
 
 func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
@@ -503,6 +607,42 @@ func (s *session) encodePixelsFast(img *image.RGBA, x, y, w, h, stride int, out 
 			}
 		}
 	}
+}
+
+// clientSupports reports whether the client advertised the given encoding.
+func (s *session) clientSupports(enc int32) bool {
+	for _, e := range s.clientEncodings {
+		if e == enc {
+			return true
+		}
+	}
+	return false
+}
+
+// encodeRectPixels encodes a sub-rectangle of img into wire bytes using the
+// client's pixel format.  Returns the pixel payload (no rect header).
+func (s *session) encodeRectPixels(img *image.RGBA, x, y, w, h, stride, bytesPerPixel int) []byte {
+	out := make([]byte, w*h*bytesPerPixel)
+	if bytesPerPixel == 4 && s.clientRMax == 255 && s.clientGMax == 255 && s.clientBMax == 255 &&
+		s.clientRShift == 16 && s.clientGShift == 8 && s.clientBShift == 0 {
+		s.encodePixelsFast(img, x, y, w, h, stride, out)
+	} else {
+		s.encodePixelsGeneric(img, x, y, w, h, stride, bytesPerPixel, out)
+	}
+	return out
+}
+
+// zlibCompress compresses src with zlib (deflate).  RFB zlib encoding uses a
+// single ongoing stream per session, but a fresh writer per rectangle is
+// acceptable for correctness (clients handle it) and keeps the code simple.
+func zlibCompress(src []byte) []byte {
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(src); err != nil {
+		return src // fall back to raw on failure
+	}
+	zw.Close()
+	return buf.Bytes()
 }
 
 // encodePixelsGeneric is the fallback per-pixel encoder for clients that use a

@@ -70,6 +70,10 @@ type ScreenCapturer interface {
 	Width() int
 	Height() int
 	Capture() (*image.RGBA, error)
+	// CaptureDirty returns the current frame and the dirty rectangles since
+	// the last call.  Implementations without change detection may return a
+	// nil slice to force a full update.
+	CaptureDirty() (*image.RGBA, []Rect, error)
 }
 
 // InputInjector is the interface used by the RFB session to deliver
