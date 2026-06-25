@@ -2,3 +2,7 @@
 .serena/
 .codex/
 .agents/
+
+# Build artifacts
+dist/
+*.exe
