@@ -409,6 +409,9 @@ func (s *session) handleSetEncodings() error {
 		return err
 	}
 	numEnc := binary.BigEndian.Uint16(header[1:3])
+	if numEnc > 256 { // SEC-5: bound untrusted client input
+		return fmt.Errorf("too many encodings: %d (max 256)", numEnc)
+	}
 	buf := make([]byte, int(numEnc)*4)
 	if _, err := io.ReadFull(s.conn, buf); err != nil {
 		return err

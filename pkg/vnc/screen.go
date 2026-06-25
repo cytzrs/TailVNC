@@ -179,7 +179,7 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 		},
 	}
 
-	var bits uintptr
+	var bits unsafe.Pointer
 	bmp, _, _ := procCreateDIBSection.Call(
 		screenDC,
 		uintptr(unsafe.Pointer(&bi)),
@@ -187,7 +187,7 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 		uintptr(unsafe.Pointer(&bits)),
 		0, 0,
 	)
-	if bmp == 0 || bits == 0 {
+	if bmp == 0 || bits == nil {
 		return nil, fmt.Errorf("CreateDIBSection failed (bmp=%v bits=%v)", bmp, bits)
 	}
 	defer procDeleteObject.Call(bmp)
@@ -202,7 +202,7 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 
 	// bits points to the raw BGRA pixel data.
 	n := c.width * c.height * 4
-	raw := unsafe.Slice((*byte)(unsafe.Pointer(bits)), n)
+	raw := unsafe.Slice((*byte)(bits), n)
 
 	// Convert BGRA -> RGBA
 	img := image.NewRGBA(image.Rect(0, 0, c.width, c.height))
