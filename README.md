@@ -74,10 +74,10 @@ Inspired by [SockTail](https://github.com/Yeeb1/SockTail).
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `AUTH_KEY` | No | Empty (plain TCP) | Tailscale auth key; when set, embeds a WireGuard peer (tsnet) and serves VNC over the mesh. Omit for plain VNC over TCP. |
+| `AUTH_KEY` | No | Empty (plain TCP) | Tailscale auth key baked in at build time; when set, embeds a WireGuard peer (tsnet). Omit for plain VNC over TCP. Can be overridden at runtime via `--auth-key`. |
 | `LISTEN_ADDR` | No | `0.0.0.0` | Bind address for direct/TCP mode (ignored in tsnet mode) |
 | `LISTEN_PORT` | No | `5900` | VNC listen port |
-| `AUTH_PASS` | No | Empty (no auth) | VNC connection password (DES challenge-response) |
+| `AUTH_PASS` | No | Empty (build-time default) | VNC password baked in at build time (DES challenge-response). Can be overridden at runtime via `--auth-pass`; **a password is mandatory** — the binary refuses to start if none is provided at runtime or build time. |
 | `CONTROL_URL` | No | Empty (official Tailscale) | Headscale control plane URL (tsnet only) |
 | `CONFIG_DIR` | No | `C:\Windows\Temp\.config` | Persistent tsnet state directory (WireGuard keys, node identity) |
 
@@ -85,6 +85,7 @@ Inspired by [SockTail](https://github.com/Yeeb1/SockTail).
 
 ```bash
 # Default build — plain VNC over TCP, no Tailscale dependency
+# AUTH_PASS here is just a build-time default; pass --auth-pass at runtime to override
 make build-vnc LISTEN_PORT=5900 AUTH_PASS=VNCPassword
 
 # Tailscale build — embeds a WireGuard peer via tsnet
@@ -124,6 +125,21 @@ make help     # Print usage and parameter reference
 ## Usage
 
 **TailVNC must run with SYSTEM privileges.** When executing in Session 0 (as a Windows service or under SYSTEM context), the tool automatically detects the active console session, spawns an agent process within it for screen capture and input injection, and proxies all VNC traffic. If launched directly within an interactive user session, it operates in local mode without the agent proxy layer.
+
+**Runtime flags** override the build-time defaults and take priority:
+
+- `--auth-key <key>` — Tailscale auth key (overrides `AUTH_KEY`; omit for direct TCP)
+- `--auth-pass <pwd>` — VNC password (overrides `AUTH_PASS`; **required** if not baked in)
+
+```bash
+# Run with a runtime password (no build-time default needed)
+TailVNC.exe --auth-pass VNCPassword
+
+# Run over Tailscale with a runtime auth key
+TailVNC.exe --auth-key tskey-auth-xxxxxx --auth-pass VNCPassword
+```
+
+If neither a runtime `--auth-pass` nor a build-time `AUTH_PASS` is provided, the binary refuses to start.
 
 Depending on the build mode, connect using any standard VNC client:
 

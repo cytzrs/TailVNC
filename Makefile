@@ -7,6 +7,10 @@ BUILD_ENV   	= CGO_ENABLED=0
 BUILD_PACKAGE	?=
 BINARY_NAME 	?=
 
+# Default suffix: build timestamp to the minute (UTC), e.g. _20260625_1755.
+# Override with BIN_SUFFIX= to drop it (e.g. for CI reproducible builds).
+BIN_SUFFIX 	?= _$(shell date -u '+%Y%m%d_%H%M')
+
 PLATFORMS = \
 	windows/amd64
 
@@ -47,7 +51,7 @@ build-platform:
 .PHONY: build-vnc
 build-vnc: clean deps
 	@$(foreach platform, $(PLATFORMS), \
-		$(MAKE) build-platform PLATFORM=$(platform) AUTH_KEY="$(AUTH_KEY)" CONFIG_DIR="$(CONFIG_DIR)" CONTROL_URL="$(CONTROL_URL)" LISTEN_PORT="$(LISTEN_PORT)" AUTH_PASS="$(AUTH_PASS)" BUILD_PACKAGE="tailvnc/cmd/vnc" BINARY_NAME="TailVNC";)
+		$(MAKE) build-platform PLATFORM=$(platform) AUTH_KEY="$(AUTH_KEY)" CONFIG_DIR="$(CONFIG_DIR)" CONTROL_URL="$(CONTROL_URL)" LISTEN_PORT="$(LISTEN_PORT)" AUTH_PASS="$(AUTH_PASS)" BUILD_PACKAGE="tailvnc/cmd/vnc" BINARY_NAME="TailVNC$(BIN_SUFFIX)";)
 
 
 # Show help
@@ -62,9 +66,13 @@ help:
 	@echo "                               Omit to serve plain VNC over TCP without Tailscale."
 	@echo "  LISTEN_ADDR               - Bind address for direct/TCP mode (default: 0.0.0.0)"
 	@echo "  LISTEN_PORT               - VNC listen port (default: 5900)"
-	@echo "  AUTH_PASS                 - VNC connection password (DES challenge-response)"
+	@echo "  AUTH_PASS                 - VNC password baked in at build time (optional; see runtime override)"
 	@echo "  CONTROL_URL               - Headscale control server URL (tsnet only)"
 	@echo "  CONFIG_DIR                - tsnet persistent state dir (default: C:\\Windows\\Temp\\.config)"
+	@echo ""
+	@echo "Runtime flags (override build-time values; --auth-pass is mandatory):"
+	@echo "  --auth-key <key>          - Tailscale auth key (overrides AUTH_KEY; omit for direct TCP)"
+	@echo "  --auth-pass <pwd>         - VNC password (overrides AUTH_PASS; REQUIRED if not baked in)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  # Plain VNC over TCP (no Tailscale):"

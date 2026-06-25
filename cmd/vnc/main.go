@@ -42,16 +42,23 @@ var buildWithAuthPass string
 // Only used when no Tailscale auth key is provided. Defaults to 0.0.0.0.
 var buildWithListenAddr string
 
-// agentPort returns the port number from "--agent <port>" in os.Args,
-// or an empty string if this is not an agent invocation.
-func agentPort() string {
+// flagValue returns the value following a "--name" flag in os.Args, or the
+// empty string when the flag is absent.  Lightweight command-line parsing
+// without depending on the flag package.
+func flagValue(name string) string {
 	args := os.Args[1:]
 	for i, a := range args {
-		if a == "--agent" && i+1 < len(args) {
+		if a == name && i+1 < len(args) {
 			return args[i+1]
 		}
 	}
 	return ""
+}
+
+// agentPort returns the port number from "--agent <port>" in os.Args,
+// or an empty string if this is not an agent invocation.
+func agentPort() string {
+	return flagValue("--agent")
 }
 
 // runAgent runs a local VNC server on 127.0.0.1:<port>.
@@ -143,10 +150,13 @@ func main() {
 		configDir = buildWithConfigDir
 	}
 
-	if buildWithObfuscatedAuthKey != "" {
+	// Auth key: runtime --auth-key takes priority over the build-time value.
+	if rt := flagValue("--auth-key"); rt != "" {
+		authKey = rt
+	} else if buildWithObfuscatedAuthKey != "" {
 		authKey = deobfuscator.DeobfuscateAuthKey(buildWithObfuscatedAuthKey)
 	}
-	// authKey stays empty when no key is embedded -> direct TCP mode below.
+	// authKey stays empty when neither is provided -> direct TCP mode below.
 
 	if buildWithControlURL != "" {
 		controlURL = buildWithControlURL
@@ -156,8 +166,15 @@ func main() {
 		listenPort = buildWithListenPort
 	}
 
-	if buildWithAuthPass != "" {
+	// VNC password: runtime --auth-pass takes priority over the build-time
+	// value.  A password is mandatory — refuse to start without one so the
+	// desktop is never exposed unauthenticated.
+	if rt := flagValue("--auth-pass"); rt != "" {
+		authPass = rt
+	} else if buildWithAuthPass != "" {
 		authPass = buildWithAuthPass
+	} else {
+		log.Fatal("no VNC password: pass --auth-pass <pwd> at runtime or set AUTH_PASS at build time")
 	}
 
 	// Listen address for direct (non-tsnet) mode. Defaults to all interfaces.
