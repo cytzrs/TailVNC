@@ -8,9 +8,7 @@ import (
 )
 
 var (
-	procSendInput    = user32.NewProc("SendInput")
-	procSetCursorPos = user32.NewProc("SetCursorPos")
-	procGetCursorPos = user32.NewProc("GetCursorPos")
+	procSendInput = user32.NewProc("SendInput")
 
 	// procOpenEventW: used to signal the service-side SAS listener.
 	procOpenEventW = kernel32.NewProc("OpenEventW")
@@ -37,7 +35,7 @@ const (
 	keyeventfUnicode  = 0x0004
 	keyeventfScanCode = 0x0008
 
-	extendedKeyFlag = 0xe000
+	extendedKeyFlag = 0x0001
 )
 
 // mouseInput mirrors the WIN32 MOUSEINPUT structure.
@@ -102,15 +100,14 @@ func sendKeyInput(vk uint16, scanCode uint16, flags uint32) {
 // SimulatePointer handles a VNC pointer event: x, y are desktop coordinates,
 // buttonMask follows the RFB spec (bit0=left, bit1=middle, bit2=right).
 func SimulatePointer(x, y int, buttonMask uint8, screenW, screenH int) {
-	// Convert to absolute coordinates (0–65535)
+	// Convert to absolute mickeys (0–65535) and inject via SendInput.  This is
+	// the canonical absolute move: it goes through the input stream so it is
+	// observed by every application (including full-screen/DirectInput games).
+	// SetCursorPos was previously called as well, but it bypasses the input
+	// stream and was redundant with the absolute SendInput below.
 	absX := int32(x * 65535 / screenW)
 	absY := int32(y * 65535 / screenH)
-
-	procSetCursorPos.Call(uintptr(x), uintptr(y))
-	_ = absX
-	_ = absY
-
-	sendMouseInput(mouseeventfMove|mouseeventfAbsolute, int32(x*65535/screenW), int32(y*65535/screenH), 0)
+	sendMouseInput(mouseeventfMove|mouseeventfAbsolute, absX, absY, 0)
 }
 
 var prevButtonMask uint8
@@ -299,7 +296,7 @@ func SimulateKeyEvent(keysym uint32, down bool) {
 		flags |= keyeventfKeyUp
 	}
 	if extended {
-		flags |= keyeventfScanCode
+		flags |= extendedKeyFlag
 	}
 	sendKeyInput(vk, 0, flags)
 }

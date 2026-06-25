@@ -77,6 +77,17 @@ type session struct {
 
 func (s *session) addr() string { return s.conn.RemoteAddr().String() }
 
+// syncDims refreshes the cached framebuffer dimensions from the capturer.
+// The capturer tracks the current desktop, whose resolution may change on a
+// desktop transition (e.g. to the Winlogon secure desktop); a stale snapshot
+// would shift injected pointer coordinates and mis-clamp framebuffer updates.
+func (s *session) syncDims() {
+	if w, h := s.capturer.Width(), s.capturer.Height(); w > 0 && h > 0 {
+		s.serverW = w
+		s.serverH = h
+	}
+}
+
 // initClientPixelFormat sets the client pixel format to match the server's
 // declared ServerInit format. Called once before the handshake.
 func (s *session) initClientPixelFormat() {
@@ -204,6 +215,9 @@ func (s *session) handshake() error {
 // doVNCAuth performs the RFB VNC Authentication challenge-response (security type 2).
 // Key bytes are bit-reversed per the RFB spec. Empty server password accepts any client.
 func (s *session) doVNCAuth() error {
+	if s.password == "" {
+		return fmt.Errorf("vnc auth requested but no server password configured")
+	}
 	challenge := make([]byte, 16)
 	if _, err := rand.Read(challenge); err != nil {
 		return err
@@ -218,11 +232,9 @@ func (s *session) doVNCAuth() error {
 	}
 
 	var result uint32
-	if s.password != "" {
-		expected := vncAuthEncrypt(challenge, s.password)
-		if !bytes.Equal(expected, response) {
-			result = 1
-		}
+	expected := vncAuthEncrypt(challenge, s.password)
+	if !bytes.Equal(expected, response) {
+		result = 1
 	}
 
 	if err := binary.Write(s.conn, binary.BigEndian, result); err != nil {
@@ -394,6 +406,7 @@ func (s *session) handleFBUpdateRequest() error {
 	h := int(binary.BigEndian.Uint16(req[7:9]))
 	log.Printf("[%s]   FBUpdateReq: incremental=%d x=%d y=%d w=%d h=%d", s.addr(), incremental, x, y, w, h)
 
+	s.syncDims()
 	img, err := s.capturer.Capture()
 	if err != nil {
 		return err
@@ -433,9 +446,70 @@ func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
 	binary.BigEndian.PutUint16(buf[10:12], uint16(h))
 	binary.BigEndian.PutUint32(buf[12:16], uint32(encRaw))
 
-	// Encode pixels according to the client's requested pixel format.
+	// Encode pixels.  The common case — a 32-bpp client using the canonical
+	// RGB-255 / R,G,B-shift 16,8,0 format — is handled by the fast path
+	// (bulk per-row copy with an optional byte-swap).  Anything else falls
+	// back to the generic per-pixel loop for correctness.
 	off := 16
 	stride := img.Stride
+
+	if s.canUseFastPath(bytesPerPixel) {
+		s.encodePixelsFast(img, x, y, w, h, stride, buf[off:])
+	} else {
+		s.encodePixelsGeneric(img, x, y, w, h, stride, bytesPerPixel, buf[off:])
+	}
+
+	log.Printf("[%s] >> FBU raw %dx%d (%d bytes)", s.addr(), w, h, len(buf))
+	s.writeMu.Lock()
+	_, err := s.conn.Write(buf)
+	s.writeMu.Unlock()
+	if err != nil {
+		log.Printf("[%s]    write error: %v", s.addr(), err)
+	}
+	return err
+}
+
+// canUseFastPath reports whether the client's pixel format matches the server's
+// native 32-bpp XRGB layout closely enough to use the bulk-copy fast path.
+// It requires 32 bpp, RGB maxes of 255 and the canonical 16/8/0 shifts, which
+// is what virtually every RFB client negotiates by default.
+func (s *session) canUseFastPath(bytesPerPixel int) bool {
+	return bytesPerPixel == 4 &&
+		s.clientRMax == 255 && s.clientGMax == 255 && s.clientBMax == 255 &&
+		s.clientRShift == 16 && s.clientGShift == 8 && s.clientBShift == 0
+}
+
+// encodePixelsFast copies pixels row-by-row from the captured RGBA image into
+// the output buffer.  When the client declared a big-endian format the bytes
+// within each 32-bit pixel are swapped (RGBA -> BGRA) in place, otherwise the
+// memory is copied verbatim.  This avoids the per-pixel multiply/shift loop.
+func (s *session) encodePixelsFast(img *image.RGBA, x, y, w, h, stride int, out []byte) {
+	rowBytes := w * 4
+	for row := 0; row < h; row++ {
+		src := img.Pix[(y+row)*stride+x*4 : (y+row)*stride+x*4+rowBytes]
+		dst := out[row*rowBytes : (row+1)*rowBytes]
+		// Source pixel is RGBA {R,G,B,A}.  The canonical RGB-255 format packs
+		// a pixel as R<<16 | G<<8 | B (the X/padding byte is the high byte);
+		// only the in-memory byte order depends on the client endianness.
+		if s.clientBigEndian != 0 {
+			// Big-endian word MSB→LSB: {0, R, G, B}.
+			for i := 0; i < rowBytes; i += 4 {
+				dst[i], dst[i+1], dst[i+2], dst[i+3] = 0, src[i], src[i+1], src[i+2]
+			}
+		} else {
+			// Little-endian word LSB→MSB: {B, G, R, 0}.
+			for i := 0; i < rowBytes; i += 4 {
+				dst[i], dst[i+1], dst[i+2], dst[i+3] = src[i+2], src[i+1], src[i], 0
+			}
+		}
+	}
+}
+
+// encodePixelsGeneric is the fallback per-pixel encoder for clients that use a
+// non-canonical pixel format (low/true colour, non-255 maxes, odd shifts).  It
+// scales and bit-shifts each channel as the client requested.
+func (s *session) encodePixelsGeneric(img *image.RGBA, x, y, w, h, stride, bytesPerPixel int, out []byte) {
+	off := 0
 	for row := y; row < y+h; row++ {
 		for col := x; col < x+w; col++ {
 			p := row*stride + col*4
@@ -449,25 +523,16 @@ func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
 
 			if s.clientBigEndian != 0 {
 				for i := 0; i < bytesPerPixel; i++ {
-					buf[off+i] = byte(pixel >> uint((bytesPerPixel-1-i)*8))
+					out[off+i] = byte(pixel >> uint((bytesPerPixel-1-i)*8))
 				}
 			} else {
 				for i := 0; i < bytesPerPixel; i++ {
-					buf[off+i] = byte(pixel >> uint(i*8))
+					out[off+i] = byte(pixel >> uint(i*8))
 				}
 			}
 			off += bytesPerPixel
 		}
 	}
-
-	log.Printf("[%s] >> FBU raw %dx%d (%d bytes)", s.addr(), w, h, len(buf))
-	s.writeMu.Lock()
-	_, err := s.conn.Write(buf)
-	s.writeMu.Unlock()
-	if err != nil {
-		log.Printf("[%s]    write error: %v", s.addr(), err)
-	}
-	return err
 }
 
 func (s *session) handleKeyEvent() error {
@@ -489,6 +554,7 @@ func (s *session) handlePointerEvent() error {
 	buttonMask := data[0]
 	x := int(binary.BigEndian.Uint16(data[1:3]))
 	y := int(binary.BigEndian.Uint16(data[3:5]))
+	s.syncDims()
 	s.injector.InjectPointer(buttonMask, x, y, s.serverW, s.serverH)
 	return nil
 }

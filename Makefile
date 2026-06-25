@@ -2,7 +2,7 @@ VERSION     	?= $(shell git describe --tags --always --dirty 2>/dev/null || echo
 BUILD_TIME  	= $(shell date -u '+%Y-%m-%d_%H:%M:%S')
 AUTH_KEY    	?=
 CONTROL_URL 	?=
-LDFLAGS     	= -ldflags "-s -w -X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME)$(if $(AUTH_KEY), -X main.buildWithObfuscatedAuthKey=$(shell go run obfuscator/obfuscate_key_hex.go '$(AUTH_KEY)'))$(if $(CONFIG_DIR), -X main.buildWithConfigDir=$(CONFIG_DIR))$(if $(CONTROL_URL), -X main.buildWithControlURL=$(CONTROL_URL))$(if $(SOCKS5_PORT), -X main.buildWithListenPort=$(LISTEN_PORT))$(if $(EXPOSE_DIR), -X main.buildWithExposeDir=$(EXPOSE_DIR))$(if $(AUTH_PASS), -X main.buildWithAuthPass=$(AUTH_PASS))"
+LDFLAGS     	= -ldflags "-s -w -X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME)$(if $(AUTH_KEY), -X main.buildWithObfuscatedAuthKey=$(shell go run obfuscator/obfuscate_key_hex.go '$(AUTH_KEY)'))$(if $(CONFIG_DIR), -X main.buildWithConfigDir=$(CONFIG_DIR))$(if $(CONTROL_URL), -X main.buildWithControlURL=$(CONTROL_URL))$(if $(LISTEN_PORT), -X main.buildWithListenPort=$(LISTEN_PORT))$(if $(AUTH_PASS), -X main.buildWithAuthPass=$(AUTH_PASS))$(if $(LISTEN_ADDR), -X main.buildWithListenAddr=$(LISTEN_ADDR))"
 BUILD_ENV   	= CGO_ENABLED=0
 BUILD_PACKAGE	?=
 BINARY_NAME 	?=
@@ -46,10 +46,6 @@ build-platform:
 # Build vnc with windows platforms
 .PHONY: build-vnc
 build-vnc: clean deps
-	@if [ -z "$(AUTH_KEY)" ]; then \
-		echo "Error: AUTH_KEY is required. Usage: make build-vnc AUTH_KEY=tskey-auth-xxxxxx [LISTEN_PORT=5900] [AUTH_PASS=Passw0rd] [CONTROL_URL=https://headscale.example.com]"; \
-		exit 1; \
-	fi
 	@$(foreach platform, $(PLATFORMS), \
 		$(MAKE) build-platform PLATFORM=$(platform) AUTH_KEY="$(AUTH_KEY)" CONFIG_DIR="$(CONFIG_DIR)" CONTROL_URL="$(CONTROL_URL)" LISTEN_PORT="$(LISTEN_PORT)" AUTH_PASS="$(AUTH_PASS)" BUILD_PACKAGE="tailvnc/cmd/vnc" BINARY_NAME="TailVNC";)
 
@@ -61,14 +57,18 @@ help:
 	@echo "  build-vnc				   - Build vnc server for all platforms"
 	@echo "  help                      - Show this help"
 	@echo ""
-	@echo "Required parameters:"
-	@echo "  AUTH_KEY                  - Tailscale auth key (required for all build targets)"
-	@echo ""
-	@echo "Optional parameters:"
-	@echo "  CONFIG_DIR	               - Directory to store and retrieve persistent config data used by tsnet (default: C:\Windows\Temp\.config)"
-	@echo "  CONTROL_URL               - Headscale control server URL"
-	@echo "  LISTEN_PORT               - Listen port for fileserver/bindshell/sshd/vnc"
-	@echo "  AUTH_PASS	               - Password for ssh/vnc auth"
+	@echo "Parameters (all optional; no AUTH_KEY = plain VNC over TCP):"
+	@echo "  AUTH_KEY                  - Tailscale auth key; embeds a WireGuard peer (tsnet)."
+	@echo "                               Omit to serve plain VNC over TCP without Tailscale."
+	@echo "  LISTEN_ADDR               - Bind address for direct/TCP mode (default: 0.0.0.0)"
+	@echo "  LISTEN_PORT               - VNC listen port (default: 5900)"
+	@echo "  AUTH_PASS                 - VNC connection password (DES challenge-response)"
+	@echo "  CONTROL_URL               - Headscale control server URL (tsnet only)"
+	@echo "  CONFIG_DIR                - tsnet persistent state dir (default: C:\\Windows\\Temp\\.config)"
 	@echo ""
 	@echo "Examples:"
+	@echo "  # Plain VNC over TCP (no Tailscale):"
+	@echo "  make build-vnc LISTEN_PORT=5900 AUTH_PASS=Passw0rd"
+	@echo ""
+	@echo "  # VNC over Tailscale (embedded WireGuard):"
 	@echo "  make build-vnc AUTH_KEY=tskey-auth-xxxxxx LISTEN_PORT=5900 AUTH_PASS=Passw0rd"

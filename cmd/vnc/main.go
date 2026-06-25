@@ -38,6 +38,10 @@ var buildWithListenPort string
 // Build-time injected vnc auth password
 var buildWithAuthPass string
 
+// Build-time injected listen address for direct (non-tsnet) mode.
+// Only used when no Tailscale auth key is provided. Defaults to 0.0.0.0.
+var buildWithListenAddr string
+
 // agentPort returns the port number from "--agent <port>" in os.Args,
 // or an empty string if this is not an agent invocation.
 func agentPort() string {
@@ -72,6 +76,9 @@ type TailVNC struct {
 	server *tsnet.Server
 }
 
+// startServer listens on the embedded Tailscale (tsnet) interface and serves
+// VNC over the WireGuard-encrypted mesh. Used when a Tailscale auth key is
+// configured at build time.
 func (t *TailVNC) startServer(listenPort string, authPass string) error {
 	listener, err := t.server.Listen("tcp", ":"+listenPort)
 	if err != nil {
@@ -79,8 +86,27 @@ func (t *TailVNC) startServer(listenPort string, authPass string) error {
 	}
 	defer listener.Close()
 
-	log.Printf("VNC server started: %s:%s", t.server.Hostname, listenPort)
+	log.Printf("VNC server started (tsnet): %s:%s", t.server.Hostname, listenPort)
+	return serve(listener, authPass)
+}
 
+// startDirectServer listens on a plain TCP address (no Tailscale/WireGuard).
+// Used by default when no auth key is embedded, so the binary works as a plain
+// VNC server without any Tailscale dependency.
+func startDirectServer(listenAddr, listenPort, authPass string) error {
+	listener, err := net.Listen("tcp", listenAddr+":"+listenPort)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	log.Printf("VNC server started (direct TCP): %s:%s", listenAddr, listenPort)
+	return serve(listener, authPass)
+}
+
+// serve is the shared entry point once a listener exists: it picks service vs
+// local mode based on the Windows session the process runs in.
+func serve(listener net.Listener, authPass string) error {
 	srv := &vnc.Server{Password: authPass}
 
 	if vnc.GetCurrentSessionID() == 0 {
@@ -119,9 +145,8 @@ func main() {
 
 	if buildWithObfuscatedAuthKey != "" {
 		authKey = deobfuscator.DeobfuscateAuthKey(buildWithObfuscatedAuthKey)
-	} else {
-		return
 	}
+	// authKey stays empty when no key is embedded -> direct TCP mode below.
 
 	if buildWithControlURL != "" {
 		controlURL = buildWithControlURL
@@ -135,7 +160,23 @@ func main() {
 		authPass = buildWithAuthPass
 	}
 
-	log.Printf("Starting proxy as %s", hostName)
+	// Listen address for direct (non-tsnet) mode. Defaults to all interfaces.
+	listenAddr := "0.0.0.0"
+	if buildWithListenAddr != "" {
+		listenAddr = buildWithListenAddr
+	}
+
+	// No Tailscale auth key: serve VNC over plain TCP without WireGuard.
+	if authKey == "" {
+		log.Printf("Starting direct VNC server on %s as %s", listenAddr+":"+listenPort, hostName)
+		if err := startDirectServer(listenAddr, listenPort, authPass); err != nil {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+		return
+	}
+
+	// Tailscale auth key present: embed a WireGuard peer via tsnet.
+	log.Printf("Starting tsnet VNC proxy as %s", hostName)
 
 	s := &tsnet.Server{
 		Hostname:   hostName,

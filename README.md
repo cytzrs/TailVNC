@@ -48,7 +48,7 @@ Inspired by [SockTail](https://github.com/Yeeb1/SockTail).
 | Component | Technology |
 |-----------|------------|
 | Language | Go 1.25+ |
-| Network Transport | [Tailscale tsnet](https://pkg.go.dev/tailscale.com/tsnet) — embedded WireGuard peer |
+| Network Transport | [Tailscale tsnet](https://pkg.go.dev/tailscale.com/tsnet) (optional, embedded WireGuard) or plain TCP |
 | VNC Protocol | RFB 3.008 (custom implementation, Raw encoding) |
 | Screen Capture | Windows GDI+ (`CreateDIBSection`, `BitBlt`) |
 | Input Injection | Windows `SendInput` API |
@@ -56,7 +56,7 @@ Inspired by [SockTail](https://github.com/Yeeb1/SockTail).
 | Desktop Switching | `OpenInputDesktop` + `SetThreadDesktop` |
 | SAS Injection | `sas.dll!SendSAS` |
 | Authentication | VNC DES challenge-response (per RFB spec) |
-| Key Obfuscation | XOR + hex encoding |
+| Key Obfuscation | AES-256-CTR + hex encoding |
 | System Calls | `golang.org/x/sys` (Windows syscall wrappers) |
 | Binary Compression | UPX (optional) |
 | Build System | GNU Make + Go LDFLAGS injection |
@@ -68,33 +68,34 @@ Inspired by [SockTail](https://github.com/Yeeb1/SockTail).
 - **Go** >= 1.25.3
 - **GNU Make**
 - **UPX** (optional, for binary size reduction)
-- **Tailscale Auth Key** — generate from the Tailscale admin console; reusable + ephemeral keys are recommended for operational use
+- **Tailscale Auth Key** *(optional)* — only required to embed a WireGuard peer (tsnet). Omit to serve plain VNC over TCP.
 
 ### Build Parameters
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `AUTH_KEY` | Yes | — | Tailscale auth key; automatically XOR-obfuscated and embedded at compile time |
-| `LISTEN_PORT` | No | `5900` | VNC listen port on the Tailscale interface |
+| `AUTH_KEY` | No | Empty (plain TCP) | Tailscale auth key; when set, embeds a WireGuard peer (tsnet) and serves VNC over the mesh. Omit for plain VNC over TCP. |
+| `LISTEN_ADDR` | No | `0.0.0.0` | Bind address for direct/TCP mode (ignored in tsnet mode) |
+| `LISTEN_PORT` | No | `5900` | VNC listen port |
 | `AUTH_PASS` | No | Empty (no auth) | VNC connection password (DES challenge-response) |
-| `CONTROL_URL` | No | Empty (official Tailscale) | Headscale control plane URL |
-| `CONFIG_DIR` | No | `C:\Windows\Temp\.cache` | Persistent tsnet state directory (WireGuard keys, node identity) |
+| `CONTROL_URL` | No | Empty (official Tailscale) | Headscale control plane URL (tsnet only) |
+| `CONFIG_DIR` | No | `C:\Windows\Temp\.config` | Persistent tsnet state directory (WireGuard keys, node identity) |
 
 ### Compilation
 
 ```bash
-# Minimal build — only auth key required
-make build-vnc AUTH_KEY=tskey-auth-kBEXAMPLEKEY
+# Default build — plain VNC over TCP, no Tailscale dependency
+make build-vnc LISTEN_PORT=5900 AUTH_PASS=VNCPassword
 
-# Full build with all parameters
+# Tailscale build — embeds a WireGuard peer via tsnet
 # [CONTROL_URL] — optional, only required when using a self-hosted Headscale control plane
-# [CONFIG_DIR]  — optional, overrides the default tsnet state directory (C:\Windows\Temp\.cache)
+# [CONFIG_DIR]  — optional, overrides the default tsnet state directory (C:\Windows\Temp\.config)
 make build-vnc \
   AUTH_KEY=tskey-auth-kBEXAMPLEKEY \
   LISTEN_PORT=5900 \
   AUTH_PASS=VNCPassword \
   [CONTROL_URL=https://headscale.example.com] \
-  [CONFIG_DIR='C:\Windows\Temp\.cache']
+  [CONFIG_DIR='C:\Windows\Temp\.config']
 ```
 
 Build artifacts are written to `dist/`:
@@ -107,7 +108,7 @@ The build pipeline performs the following steps:
 
 1. Cleans previous build artifacts
 2. Downloads and tidies Go module dependencies
-3. Runs `obfuscator/` to XOR-obfuscate the auth key
+3. Runs `obfuscator/` to AES-encrypt the auth key (when `AUTH_KEY` is set)
 4. Injects all configuration into the binary via LDFLAGS (`-X`)
 5. Strips the symbol table and DWARF debug info (`-s -w`)
 6. Compresses the binary with UPX (`--best --lzma`) if available
@@ -124,11 +125,19 @@ make help     # Print usage and parameter reference
 
 **TailVNC must run with SYSTEM privileges.** When executing in Session 0 (as a Windows service or under SYSTEM context), the tool automatically detects the active console session, spawns an agent process within it for screen capture and input injection, and proxies all VNC traffic. If launched directly within an interactive user session, it operates in local mode without the agent proxy layer.
 
-Upon execution, the target host joins the configured Tailscale network as a new node. Connect using any standard VNC client:
+Depending on the build mode, connect using any standard VNC client:
 
-```
-<Tailscale IP>:5900
-```
+- **Tailscale build** (with `AUTH_KEY`): the target host joins the configured Tailscale network as a new node.
+
+  ```
+  <Tailscale IP>:5900
+  ```
+
+- **Direct/TCP build** (without `AUTH_KEY`): the server listens on `LISTEN_ADDR:LISTEN_PORT` (default `0.0.0.0:5900`).
+
+  ```
+  <target IP>:5900
+  ```
 
 ![image-20260412003923140](assets/image-20260412003923140.png)
 
