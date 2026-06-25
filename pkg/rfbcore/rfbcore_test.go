@@ -1,6 +1,7 @@
 package rfbcore
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"testing"
@@ -95,5 +96,50 @@ func TestDiffFramesCollapseOnTooMany(t *testing.T) {
 	}
 	if got := DiffFrames(prev, cur); got != nil {
 		t.Fatalf("too many dirty tiles: got %d rects, want nil (full update)", len(got))
+	}
+}
+
+func TestPixelFormatBytesPerPixel(t *testing.T) {
+	cases := []struct {
+		bpp  uint8
+		want int
+	}{
+		{32, 4},
+		{16, 2},
+		{8, 1},
+		{0, 1}, // guarded: minimum 1
+	}
+	for _, c := range cases {
+		pf := PixelFormat{Bpp: c.bpp}
+		if got := pf.BytesPerPixel(); got != c.want {
+			t.Errorf("bpp=%d: BytesPerPixel=%d, want %d", c.bpp, got, c.want)
+		}
+	}
+}
+
+func TestCanUseFastPath(t *testing.T) {
+	canonical := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	if !CanUseFastPath(canonical) {
+		t.Fatal("canonical 32bpp RGB-255 16/8/0 should use fast path")
+	}
+	if CanUseFastPath(PixelFormat{Bpp: 16, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}) {
+		t.Fatal("16bpp must not use fast path")
+	}
+}
+
+func TestEncodeRectPixelsFastPathLittleEndian(t *testing.T) {
+	// 2x1 image: pixel (0,0)=red, (1,0)=green. Canonical 32bpp, little-endian.
+	img := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	img.Set(0, 0, color.RGBA{R: 0xff, A: 0xff})
+	img.Set(1, 0, color.RGBA{G: 0xff, A: 0xff})
+	pf := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	out := EncodeRectPixels(img, 0, 0, 2, 1, img.Stride, pf)
+	if len(out) != 8 {
+		t.Fatalf("len=%d, want 8", len(out))
+	}
+	// Little-endian word {B,G,R,0}: red pixel -> {0,0,255,0}; green -> {0,255,0,0}.
+	want := []byte{0, 0, 255, 0, 0, 255, 0, 0}
+	if !bytes.Equal(out, want) {
+		t.Fatalf("out=%v, want %v", out, want)
 	}
 }
