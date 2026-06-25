@@ -208,3 +208,31 @@ func TestLatin1RoundTrip(t *testing.T) {
 		t.Fatalf("expected '?' substitution for non-Latin-1, got %v", out)
 	}
 }
+
+func TestEncodePixelsFastPathBigEndian(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 0xff, A: 0xff}) // red
+	pf := PixelFormat{Bpp: 32, BigEndian: 1, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	out := EncodeRectPixels(img, 0, 0, 1, 1, img.Stride, pf)
+	// Big-endian word MSB->LSB {0,R,G,B}: red -> {0,255,0,0}.
+	want := []byte{0, 255, 0, 0}
+	if !bytes.Equal(out, want) {
+		t.Fatalf("big-endian out=%v, want %v", out, want)
+	}
+}
+
+func TestEncodePixelsGeneric8bpp(t *testing.T) {
+	// 8bpp non-canonical -> generic path. Maxes 255, shifts 0/0/0 pack to a luminance-ish byte.
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 0xff, G: 0x80, B: 0x40, A: 0xff})
+	pf := PixelFormat{Bpp: 8, RMax: 255, GMax: 255, BMax: 255, RShift: 0, GShift: 0, BShift: 0}
+	out := EncodeRectPixels(img, 0, 0, 1, 1, img.Stride, pf)
+	if len(out) != 1 {
+		t.Fatalf("8bpp len=%d, want 1", len(out))
+	}
+	// All channels shifted by 0 and OR'd together with max 255: each channel
+	// is scaled by 255/255 = identity, then OR'd: 0xff|0x80|0x40 = 0xff.
+	if out[0] != 0xff {
+		t.Fatalf("8bpp out=0x%02x, want 0xff", out[0])
+	}
+}
