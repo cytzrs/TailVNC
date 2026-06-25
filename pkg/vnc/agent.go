@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/windows"
 	"tailvnc/pkg/authtoken"
+	"tailvnc/pkg/secureroot"
 )
 
 const (
@@ -110,6 +111,9 @@ func spawnAgentInSession(sessionID uint32, port string) (windows.Handle, []byte,
 	if err != nil {
 		return 0, nil, fmt.Errorf("Executable: %w", err)
 	}
+	if err := secureExePath(exePath); err != nil {
+		return 0, nil, fmt.Errorf("SEC-4: %w", err)
+	}
 
 	cmdLine := `"` + exePath + `" --agent ` + port
 	cmdLineW, err := windows.UTF16PtrFromString(cmdLine)
@@ -142,6 +146,22 @@ func spawnAgentInSession(sessionID uint32, port string) (windows.Handle, []byte,
 	windows.CloseHandle(pi.Thread)
 	log.Printf("[agent] spawned PID=%d in session %d on port %s (token=SYSTEM, ipc-auth=on)", pi.ProcessId, sessionID, port)
 	return pi.Process, ipcToken, nil
+}
+
+// secureExePath enforces SEC-4: the agent (re-executed as SYSTEM) may only run
+// from an admin-writable directory. SystemRoot is narrowed to System32 so
+// C:\Windows\Temp (user-writable) does not slip through. The full DACL check
+// is deferred to M3.
+func secureExePath(exePath string) error {
+	roots := []string{
+		os.Getenv("ProgramFiles"),
+		os.Getenv("ProgramFiles(x86)"),
+		os.Getenv("SystemRoot") + `\System32`,
+	}
+	if !secureroot.IsInSecureDir(exePath, roots) {
+		return fmt.Errorf("executable must live under %%ProgramFiles%% or %%SystemRoot%%\\System32; got %s", exePath)
+	}
+	return nil
 }
 
 // buildAgentEnv returns a Windows double-null-terminated UTF-16 environment
