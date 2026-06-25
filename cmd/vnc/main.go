@@ -182,8 +182,9 @@ func main() {
 		log.Fatal("no VNC password: pass --auth-pass <pwd>, set TAILVNC_AUTH_PASS env, or set AUTH_PASS at build time")
 	}
 
-	// Listen address for direct (non-tsnet) mode. Defaults to all interfaces.
-	listenAddr := "0.0.0.0"
+	// Listen address for direct (non-tsnet) mode. SEC-1: default to loopback —
+	// exposing VNC to other interfaces now requires an explicit LISTEN_ADDR.
+	listenAddr := "127.0.0.1"
 	if buildWithListenAddr != "" {
 		listenAddr = buildWithListenAddr
 	}

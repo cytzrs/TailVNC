@@ -221,6 +221,35 @@ func (s *session) handshake() error {
 	return s.sendServerInit()
 }
 
+// authFails counts recent VNCAuth failures per remote address (SEC-1) so
+// repeated wrong passwords are throttled, slowing online brute force of the
+// weak single-DES VNC auth.
+var (
+	authFailMu sync.Mutex
+	authFails  = map[string]int{}
+)
+
+// authBackoff sleeps before replying to a failed auth, scaling with the count
+// of recent failures from the same remote address (1s, 2s, ... capped 30s).
+func authBackoff(remote string) {
+	authFailMu.Lock()
+	n := authFails[remote] + 1
+	authFails[remote] = n
+	authFailMu.Unlock()
+	d := time.Second << uint(min(n, 5))
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	time.Sleep(d)
+}
+
+// authReset clears the failure counter on a successful auth.
+func authReset(remote string) {
+	authFailMu.Lock()
+	delete(authFails, remote)
+	authFailMu.Unlock()
+}
+
 // doVNCAuth performs the RFB VNC Authentication challenge-response (security type 2).
 // Key bytes are bit-reversed per the RFB spec. Empty server password accepts any client.
 func (s *session) doVNCAuth() error {
@@ -247,6 +276,13 @@ func (s *session) doVNCAuth() error {
 	}
 	if !bytes.Equal(expected, response) {
 		result = 1
+	}
+
+	// SEC-1: throttle repeated failures from the same remote address.
+	if result != 0 {
+		authBackoff(s.addr())
+	} else {
+		authReset(s.addr())
 	}
 
 	if err := binary.Write(s.conn, binary.BigEndian, result); err != nil {
