@@ -349,19 +349,25 @@ func (c *SessionAwareCapturer) loop() {
 			continue
 		}
 
+		// CORR-3: capture the adaptive-FPS decision inside the lock — the old
+		// code read c.dirty after Unlock, racing with CaptureDirty consumers.
+		needFull := false
+		hasDirty := false
 		c.mu.Lock()
 		// Compute dirty rectangles against the previous frame.  When the
 		// desktop changed (different dimensions) prevFrame is nil, forcing a
-		// full update via diffFrames returning nil.
+		// full update via DiffFrames returning nil.
 		dirty := rfbcore.DiffFrames(c.prevFrame, img)
 		c.frame = img
 		c.prevFrame = img
 		if dirty != nil {
 			c.dirty = dirty
+			hasDirty = len(dirty) > 0
 		} else {
 			// nil == full-frame update needed (first frame, resize, or
 			// too many small changes).
 			c.dirty = nil
+			needFull = true
 		}
 		c.mu.Unlock()
 
@@ -374,7 +380,7 @@ func (c *SessionAwareCapturer) loop() {
 		if staticFrames > 3 {
 			delay = 100 * time.Millisecond // static → ~10 fps
 		}
-		if len(c.dirty) != 0 || c.dirty == nil {
+		if hasDirty || needFull {
 			staticFrames = 0
 		}
 		time.Sleep(delay)
