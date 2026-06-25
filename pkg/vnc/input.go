@@ -112,16 +112,22 @@ func SimulatePointer(x, y int, buttonMask uint8, screenW, screenH int) {
 	sendMouseInput(mouseeventfMove|mouseeventfAbsolute, absX, absY, 0)
 }
 
-var prevButtonMask uint8
+// inputState holds per-session input tracking that must not be shared across
+// concurrent VNC clients (CORR-2: previously package globals).
+type inputState struct {
+	prevButton uint8
+	ctrlDown   bool
+	altDown    bool
+}
 
-// SimulateButtonEvent sends press/release events for changed buttons.
+// buttonEvent sends press/release events for changed buttons.
 // RFB button mask bits:
 //
 //	bit0=left  bit1=middle  bit2=right
 //	bit3=wheel-up  bit4=wheel-down  bit5=wheel-left  bit6=wheel-right
-func SimulateButtonEvent(buttonMask uint8, x, y, screenW, screenH int) {
-	changed := buttonMask ^ prevButtonMask
-	prevButtonMask = buttonMask
+func (st *inputState) buttonEvent(buttonMask uint8, x, y, screenW, screenH int) {
+	changed := buttonMask ^ st.prevButton
+	st.prevButton = buttonMask
 
 	absX := int32(x * 65535 / screenW)
 	absY := int32(y * 65535 / screenH)
@@ -234,13 +240,6 @@ func keysym2VK(keysym uint32) (vk uint16, scan uint16, extended bool) {
 
 var procVkKeyScanA = user32.NewProc("VkKeyScanA")
 
-// sasCtrlDown / sasAltDown track whether the client currently holds Ctrl/Alt,
-// so we can detect the Ctrl+Alt+Del combination and route it to SendSAS.
-var (
-	sasCtrlDown bool
-	sasAltDown  bool
-)
-
 // sendSAS signals the service process (session 0) to call SendSAS(FALSE).
 // SendSAS only works when called from session 0; the agent runs in session 1,
 // so it signals a named Windows event that the service listens for.
@@ -268,20 +267,20 @@ func sendSAS() {
 	}
 }
 
-// SimulateKeyEvent handles an RFB key event.
-func SimulateKeyEvent(keysym uint32, down bool) {
+// keyEvent handles an RFB key event.
+func (st *inputState) keyEvent(keysym uint32, down bool) {
 	// Track Ctrl/Alt modifier state for SAS detection.
 	switch keysym {
 	case 0xffe3, 0xffe4: // Left/Right Control
-		sasCtrlDown = down
+		st.ctrlDown = down
 	case 0xffe7, 0xffe8, 0xffe9, 0xffea: // Meta/Alt
-		sasAltDown = down
+		st.altDown = down
 	}
 
 	// Intercept Ctrl+Alt+Del → SendSAS instead of SendInput.
 	// SendInput cannot inject the Secure Attention Sequence regardless of
 	// privilege; the kernel intercepts it before the input stream.
-	if (keysym == 0xff9f || keysym == 0xffff) && sasCtrlDown && sasAltDown {
+	if (keysym == 0xff9f || keysym == 0xffff) && st.ctrlDown && st.altDown {
 		if down {
 			sendSAS()
 		}

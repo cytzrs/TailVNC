@@ -128,15 +128,15 @@ func enablePrivilege(name string) error {
 // It is used both when already in an interactive session (RunLocal) and when
 // running as a SYSTEM service after associating with the interactive window
 // station via setupInteractiveWindowStation (RunAsService).
-type LocalInput struct{}
+type LocalInput struct{ st inputState }
 
 func (l *LocalInput) InjectKey(keysym uint32, down bool) {
-	SimulateKeyEvent(keysym, down)
+	l.st.keyEvent(keysym, down)
 }
 
 func (l *LocalInput) InjectPointer(buttonMask uint8, x, y, serverW, serverH int) {
 	SimulatePointer(x, y, buttonMask, serverW, serverH)
-	SimulateButtonEvent(buttonMask, x, y, serverW, serverH)
+	l.st.buttonEvent(buttonMask, x, y, serverW, serverH)
 }
 
 // ---------- DesktopAwareInput ----------
@@ -158,6 +158,7 @@ type inputCmd struct {
 // discarded when the user is on the Winlogon / lock-screen desktop.
 type DesktopAwareInput struct {
 	ch chan inputCmd
+	st inputState
 }
 
 // NewDesktopAwareInput creates and starts the input worker goroutine.
@@ -206,10 +207,10 @@ func (d *DesktopAwareInput) loop() {
 		}
 
 		if cmd.isKey {
-			SimulateKeyEvent(cmd.keysym, cmd.down)
+			d.st.keyEvent(cmd.keysym, cmd.down)
 		} else {
 			SimulatePointer(cmd.x, cmd.y, cmd.buttonMask, cmd.serverW, cmd.serverH)
-			SimulateButtonEvent(cmd.buttonMask, cmd.x, cmd.y, cmd.serverW, cmd.serverH)
+			d.st.buttonEvent(cmd.buttonMask, cmd.x, cmd.y, cmd.serverW, cmd.serverH)
 		}
 	}
 }
