@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"tailvnc/pkg/deobfuscator"
+	"tailvnc/pkg/secrets"
 	"tailvnc/pkg/utils"
 	"tailvnc/pkg/vnc"
 
@@ -175,8 +176,10 @@ func main() {
 		authPass = rt
 	} else if buildWithAuthPass != "" {
 		authPass = buildWithAuthPass
+	} else if v := secrets.FromEnvOrFile("TAILVNC_AUTH_PASS", ""); v != "" {
+		authPass = v
 	} else {
-		log.Fatal("no VNC password: pass --auth-pass <pwd> at runtime or set AUTH_PASS at build time")
+		log.Fatal("no VNC password: pass --auth-pass <pwd>, set TAILVNC_AUTH_PASS env, or set AUTH_PASS at build time")
 	}
 
 	// Listen address for direct (non-tsnet) mode. Defaults to all interfaces.

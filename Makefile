@@ -2,7 +2,7 @@ VERSION     	?= $(shell git describe --tags --always --dirty 2>/dev/null || echo
 BUILD_TIME  	= $(shell date -u '+%Y-%m-%d_%H:%M:%S')
 AUTH_KEY    	?=
 CONTROL_URL 	?=
-LDFLAGS     	= -ldflags "-s -w -X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME)$(if $(AUTH_KEY), -X main.buildWithObfuscatedAuthKey=$(shell go run obfuscator/obfuscate_key_hex.go '$(AUTH_KEY)'))$(if $(CONFIG_DIR), -X main.buildWithConfigDir=$(CONFIG_DIR))$(if $(CONTROL_URL), -X main.buildWithControlURL=$(CONTROL_URL))$(if $(LISTEN_PORT), -X main.buildWithListenPort=$(LISTEN_PORT))$(if $(AUTH_PASS), -X main.buildWithAuthPass=$(AUTH_PASS))$(if $(LISTEN_ADDR), -X main.buildWithListenAddr=$(LISTEN_ADDR))"
+LDFLAGS     	= -ldflags "-s -w -X main.version=$(VERSION) -X main.buildTime=$(BUILD_TIME)$(if $(AUTH_KEY), -X main.buildWithObfuscatedAuthKey=$(shell AUTH_KEY='$(AUTH_KEY)' go run obfuscator/obfuscate_key_hex.go))$(if $(CONFIG_DIR), -X main.buildWithConfigDir=$(CONFIG_DIR))$(if $(CONTROL_URL), -X main.buildWithControlURL=$(CONTROL_URL))$(if $(LISTEN_PORT), -X main.buildWithListenPort=$(LISTEN_PORT))$(if $(AUTH_PASS), -X main.buildWithAuthPass=$(AUTH_PASS))$(if $(LISTEN_ADDR), -X main.buildWithListenAddr=$(LISTEN_ADDR))"
 BUILD_ENV   	= CGO_ENABLED=0
 BUILD_PACKAGE	?=
 BINARY_NAME 	?=

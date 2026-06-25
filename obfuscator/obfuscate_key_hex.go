@@ -40,9 +40,10 @@ func obfuscateAuthKeyToHex(key string) string {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <auth-key>\n", os.Args[0])
+	key := os.Getenv("AUTH_KEY")
+	if key == "" {
+		fmt.Fprintln(os.Stderr, "AUTH_KEY env var required (read from env so the key never appears in argv/ps)")
 		os.Exit(1)
 	}
-	fmt.Print(obfuscateAuthKeyToHex(os.Args[1]))
+	fmt.Print(obfuscateAuthKeyToHex(key))
 }
