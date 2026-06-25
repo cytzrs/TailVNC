@@ -1,3 +1,5 @@
+//go:build windows
+
 package vnc
 
 import (
@@ -9,6 +11,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"tailvnc/pkg/rfbcore"
 )
 
 // Server holds top-level configuration for the VNC server.
@@ -73,7 +76,7 @@ type ScreenCapturer interface {
 	// CaptureDirty returns the current frame and the dirty rectangles since
 	// the last call.  Implementations without change detection may return a
 	// nil slice to force a full update.
-	CaptureDirty() (*image.RGBA, []Rect, error)
+	CaptureDirty() (*image.RGBA, []rfbcore.Rect, error)
 }
 
 // InputInjector is the interface used by the RFB session to deliver

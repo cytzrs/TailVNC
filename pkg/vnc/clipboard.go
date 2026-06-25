@@ -1,3 +1,5 @@
+//go:build windows
+
 package vnc
 
 import (
@@ -163,25 +165,5 @@ func (lc *localClipboard) pollLoop() {
 }
 
 // ---------- Latin-1 / UTF-8 helpers ----------
-
-// latin1ToUTF8 converts RFB Latin-1 (ISO 8859-1) bytes to a UTF-8 Go string.
-func latin1ToUTF8(b []byte) string {
-	runes := make([]rune, len(b))
-	for i, c := range b {
-		runes[i] = rune(c)
-	}
-	return string(runes)
-}
-
-// utf8ToLatin1 encodes a UTF-8 string to Latin-1 bytes. Non-Latin-1 runes become '?'.
-func utf8ToLatin1(s string) []byte {
-	out := make([]byte, 0, len(s))
-	for _, r := range s {
-		if r < 256 {
-			out = append(out, byte(r))
-		} else {
-			out = append(out, '?')
-		}
-	}
-	return out
-}
+// Moved to pkg/rfbcore (Latin1ToUTF8 / UTF8ToLatin1) so they are unit-tested
+// alongside the rest of the protocol logic.

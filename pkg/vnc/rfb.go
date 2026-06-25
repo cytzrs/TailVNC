@@ -1,9 +1,9 @@
+//go:build windows
+
 package vnc
 
 import (
 	"bytes"
-	"compress/zlib"
-	"crypto/des"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -13,6 +13,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"tailvnc/pkg/rfbcore"
 )
 
 const (
@@ -147,7 +149,7 @@ func (s *session) clipboardSendLoop(ch chan string) {
 // sendServerCutText sends a ServerCutText message (type 3) to the client.
 // Text is encoded as Latin-1 (ISO 8859-1) per the RFB spec.
 func (s *session) sendServerCutText(text string) error {
-	latin1 := utf8ToLatin1(text)
+	latin1 := rfbcore.UTF8ToLatin1(text)
 	buf := make([]byte, 8+len(latin1))
 	buf[0] = serverCutText
 	// buf[1..3] = padding (zero)
@@ -239,7 +241,10 @@ func (s *session) doVNCAuth() error {
 	}
 
 	var result uint32
-	expected := vncAuthEncrypt(challenge, s.password)
+	expected, err := rfbcore.VncAuthEncrypt(challenge, s.password)
+	if err != nil {
+		return fmt.Errorf("vnc auth: %w", err)
+	}
 	if !bytes.Equal(expected, response) {
 		result = 1
 	}
@@ -254,31 +259,6 @@ func (s *session) doVNCAuth() error {
 		return fmt.Errorf("authentication failed")
 	}
 	return nil
-}
-
-// vncAuthEncrypt encrypts a 16-byte challenge with the VNC Auth DES scheme.
-func vncAuthEncrypt(challenge []byte, password string) []byte {
-	key := make([]byte, 8)
-	for i, c := range []byte(password) {
-		if i >= 8 {
-			break
-		}
-		key[i] = reverseBits(c)
-	}
-	block, _ := des.NewCipher(key)
-	out := make([]byte, 16)
-	block.Encrypt(out[:8], challenge[:8])
-	block.Encrypt(out[8:], challenge[8:])
-	return out
-}
-
-func reverseBits(b byte) byte {
-	var r byte
-	for i := 0; i < 8; i++ {
-		r = (r << 1) | (b & 1)
-		b >>= 1
-	}
-	return r
 }
 
 func (s *session) sendServerInit() error {
@@ -460,44 +440,29 @@ func (s *session) sendEmptyUpdate() error {
 // sendDirtyUpdate sends a FramebufferUpdate containing only the changed
 // rectangles.  Each rectangle is encoded separately; when the client supports
 // zlib, pixel data is zlib-compressed (encoding 6), otherwise Raw(0).
-func (s *session) sendDirtyUpdate(img *image.RGBA, dirty []Rect) error {
+func (s *session) sendDirtyUpdate(img *image.RGBA, dirty []rfbcore.Rect) error {
 	stride := img.Stride
-	bytesPerPixel := int(s.clientBpp) / 8
-	if bytesPerPixel < 1 {
-		bytesPerPixel = 1
-	}
 	useZlib := s.clientSupports(encZlib)
+	pf := s.pixelFormat()
 
 	// Build the whole message in one buffer: header + per-rect (12-byte hdr +
-	// pixel payload).  Compressed rectangles share the logic below.
+	// pixel payload). EncodeDirtyRect handles zlib and downgrades to Raw on
+	// compression failure (CORR-1: never emit raw bytes under encZlib).
 	rectHdrs := make([][]byte, 0, len(dirty))
 	pixels := make([][]byte, 0, len(dirty))
 	totalLen := 4
 
 	for _, r := range dirty {
-		px := s.encodeRectPixels(img, r.X, r.Y, r.W, r.H, stride, bytesPerPixel)
-		if useZlib {
-			cx := zlibCompress(px)
-			hdr := make([]byte, 12)
-			binary.BigEndian.PutUint16(hdr[0:2], uint16(r.X))
-			binary.BigEndian.PutUint16(hdr[2:4], uint16(r.Y))
-			binary.BigEndian.PutUint16(hdr[4:6], uint16(r.W))
-			binary.BigEndian.PutUint16(hdr[6:8], uint16(r.H))
-			binary.BigEndian.PutUint32(hdr[8:12], uint32(encZlib))
-			rectHdrs = append(rectHdrs, hdr)
-			pixels = append(pixels, cx)
-			totalLen += 12 + len(cx)
-		} else {
-			hdr := make([]byte, 12)
-			binary.BigEndian.PutUint16(hdr[0:2], uint16(r.X))
-			binary.BigEndian.PutUint16(hdr[2:4], uint16(r.Y))
-			binary.BigEndian.PutUint16(hdr[4:6], uint16(r.W))
-			binary.BigEndian.PutUint16(hdr[6:8], uint16(r.H))
-			binary.BigEndian.PutUint32(hdr[8:12], uint32(encRaw))
-			rectHdrs = append(rectHdrs, hdr)
-			pixels = append(pixels, px)
-			totalLen += 12 + len(px)
-		}
+		enc, payload := rfbcore.EncodeDirtyRect(img, r, stride, pf, useZlib)
+		hdr := make([]byte, 12)
+		binary.BigEndian.PutUint16(hdr[0:2], uint16(r.X))
+		binary.BigEndian.PutUint16(hdr[2:4], uint16(r.Y))
+		binary.BigEndian.PutUint16(hdr[4:6], uint16(r.W))
+		binary.BigEndian.PutUint16(hdr[6:8], uint16(r.H))
+		binary.BigEndian.PutUint32(hdr[8:12], uint32(enc))
+		rectHdrs = append(rectHdrs, hdr)
+		pixels = append(pixels, payload)
+		totalLen += 12 + len(payload)
 	}
 
 	msg := make([]byte, totalLen)
@@ -531,10 +496,8 @@ func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
 		return nil
 	}
 
-	bytesPerPixel := int(s.clientBpp) / 8
-	if bytesPerPixel < 1 {
-		bytesPerPixel = 1
-	}
+	pf := s.pixelFormat()
+	bytesPerPixel := pf.BytesPerPixel()
 	pixelBytes := w * h * bytesPerPixel
 	buf := make([]byte, 4+12+pixelBytes)
 
@@ -557,10 +520,10 @@ func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
 	off := 16
 	stride := img.Stride
 
-	if s.canUseFastPath(bytesPerPixel) {
-		s.encodePixelsFast(img, x, y, w, h, stride, buf[off:])
+	if rfbcore.CanUseFastPath(pf) {
+		rfbcore.EncodePixelsFast(img, x, y, w, h, stride, pf.BigEndian != 0, buf[off:])
 	} else {
-		s.encodePixelsGeneric(img, x, y, w, h, stride, bytesPerPixel, buf[off:])
+		rfbcore.EncodePixelsGeneric(img, x, y, w, h, stride, bytesPerPixel, pf, buf[off:])
 	}
 
 	log.Printf("[%s] >> FBU raw %dx%d (%d bytes)", s.addr(), w, h, len(buf))
@@ -573,39 +536,18 @@ func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
 	return err
 }
 
-// canUseFastPath reports whether the client's pixel format matches the server's
-// native 32-bpp XRGB layout closely enough to use the bulk-copy fast path.
-// It requires 32 bpp, RGB maxes of 255 and the canonical 16/8/0 shifts, which
-// is what virtually every RFB client negotiates by default.
-func (s *session) canUseFastPath(bytesPerPixel int) bool {
-	return bytesPerPixel == 4 &&
-		s.clientRMax == 255 && s.clientGMax == 255 && s.clientBMax == 255 &&
-		s.clientRShift == 16 && s.clientGShift == 8 && s.clientBShift == 0
-}
-
-// encodePixelsFast copies pixels row-by-row from the captured RGBA image into
-// the output buffer.  When the client declared a big-endian format the bytes
-// within each 32-bit pixel are swapped (RGBA -> BGRA) in place, otherwise the
-// memory is copied verbatim.  This avoids the per-pixel multiply/shift loop.
-func (s *session) encodePixelsFast(img *image.RGBA, x, y, w, h, stride int, out []byte) {
-	rowBytes := w * 4
-	for row := 0; row < h; row++ {
-		src := img.Pix[(y+row)*stride+x*4 : (y+row)*stride+x*4+rowBytes]
-		dst := out[row*rowBytes : (row+1)*rowBytes]
-		// Source pixel is RGBA {R,G,B,A}.  The canonical RGB-255 format packs
-		// a pixel as R<<16 | G<<8 | B (the X/padding byte is the high byte);
-		// only the in-memory byte order depends on the client endianness.
-		if s.clientBigEndian != 0 {
-			// Big-endian word MSB→LSB: {0, R, G, B}.
-			for i := 0; i < rowBytes; i += 4 {
-				dst[i], dst[i+1], dst[i+2], dst[i+3] = 0, src[i], src[i+1], src[i+2]
-			}
-		} else {
-			// Little-endian word LSB→MSB: {B, G, R, 0}.
-			for i := 0; i < rowBytes; i += 4 {
-				dst[i], dst[i+1], dst[i+2], dst[i+3] = src[i+2], src[i+1], src[i], 0
-			}
-		}
+// pixelFormat snapshots the client-negotiated pixel format from the session
+// fields into the rfbcore value the encoders consume.
+func (s *session) pixelFormat() rfbcore.PixelFormat {
+	return rfbcore.PixelFormat{
+		Bpp:       s.clientBpp,
+		BigEndian: s.clientBigEndian,
+		RMax:      s.clientRMax,
+		GMax:      s.clientGMax,
+		BMax:      s.clientBMax,
+		RShift:    s.clientRShift,
+		GShift:    s.clientGShift,
+		BShift:    s.clientBShift,
 	}
 }
 
@@ -617,62 +559,6 @@ func (s *session) clientSupports(enc int32) bool {
 		}
 	}
 	return false
-}
-
-// encodeRectPixels encodes a sub-rectangle of img into wire bytes using the
-// client's pixel format.  Returns the pixel payload (no rect header).
-func (s *session) encodeRectPixels(img *image.RGBA, x, y, w, h, stride, bytesPerPixel int) []byte {
-	out := make([]byte, w*h*bytesPerPixel)
-	if bytesPerPixel == 4 && s.clientRMax == 255 && s.clientGMax == 255 && s.clientBMax == 255 &&
-		s.clientRShift == 16 && s.clientGShift == 8 && s.clientBShift == 0 {
-		s.encodePixelsFast(img, x, y, w, h, stride, out)
-	} else {
-		s.encodePixelsGeneric(img, x, y, w, h, stride, bytesPerPixel, out)
-	}
-	return out
-}
-
-// zlibCompress compresses src with zlib (deflate).  RFB zlib encoding uses a
-// single ongoing stream per session, but a fresh writer per rectangle is
-// acceptable for correctness (clients handle it) and keeps the code simple.
-func zlibCompress(src []byte) []byte {
-	var buf bytes.Buffer
-	zw := zlib.NewWriter(&buf)
-	if _, err := zw.Write(src); err != nil {
-		return src // fall back to raw on failure
-	}
-	zw.Close()
-	return buf.Bytes()
-}
-
-// encodePixelsGeneric is the fallback per-pixel encoder for clients that use a
-// non-canonical pixel format (low/true colour, non-255 maxes, odd shifts).  It
-// scales and bit-shifts each channel as the client requested.
-func (s *session) encodePixelsGeneric(img *image.RGBA, x, y, w, h, stride, bytesPerPixel int, out []byte) {
-	off := 0
-	for row := y; row < y+h; row++ {
-		for col := x; col < x+w; col++ {
-			p := row*stride + col*4
-			r, g, b := img.Pix[p+0], img.Pix[p+1], img.Pix[p+2]
-
-			// Scale to client's color depth
-			rv := uint32(r) * uint32(s.clientRMax) / 255
-			gv := uint32(g) * uint32(s.clientGMax) / 255
-			bv := uint32(b) * uint32(s.clientBMax) / 255
-			pixel := (rv << s.clientRShift) | (gv << s.clientGShift) | (bv << s.clientBShift)
-
-			if s.clientBigEndian != 0 {
-				for i := 0; i < bytesPerPixel; i++ {
-					out[off+i] = byte(pixel >> uint((bytesPerPixel-1-i)*8))
-				}
-			} else {
-				for i := 0; i < bytesPerPixel; i++ {
-					out[off+i] = byte(pixel >> uint(i*8))
-				}
-			}
-			off += bytesPerPixel
-		}
-	}
 }
 
 func (s *session) handleKeyEvent() error {
@@ -714,7 +600,7 @@ func (s *session) handleCutText() error {
 	}
 	// RFB ClientCutText is Latin-1 encoded; convert to UTF-8 for Windows clipboard.
 	if s.clipBoard != nil && length > 0 {
-		s.clipBoard.SetText(latin1ToUTF8(buf))
+		s.clipBoard.SetText(rfbcore.Latin1ToUTF8(buf))
 	}
 	return nil
 }

@@ -1,3 +1,5 @@
+//go:build windows
+
 package vnc
 
 import (
@@ -10,6 +12,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"tailvnc/pkg/rfbcore"
 )
 
 var (
@@ -212,82 +215,6 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 	return img, nil
 }
 
-// Rect is a dirty rectangle in framebuffer coordinates.
-type Rect struct{ X, Y, W, H int }
-
-// dirtyTileSize is the granularity of per-tile change detection.  Comparing
-// the framebuffer in 32x32-cell tiles lets us use word-sized memcmp over whole
-// rows of a tile (32 px = 128 B = 16 uint64) instead of per-pixel checks.
-const dirtyTileSize = 32
-
-// maxDirtyRects caps the number of dirty rectangles reported per frame.
-// When the screen is changing so much that we exceed this, we collapse the
-// remainder into a single full-screen rectangle, which compresses better than
-// thousands of small ones.
-const maxDirtyRects = 256
-
-// diffFrames compares two equally-sized RGBA frames tile-by-tile and returns
-// the bounding rectangles of changed regions.  Returns nil when prev is nil
-// (first frame / desktop switch → full update) or when both are identical.
-//
-// Comparison is word-wise: each tile row is 32*4 = 128 bytes = 16 uint64s, so
-// a whole tile (32 rows) costs 512 word comparisons, which is very cache
-// friendly and avoids any per-pixel Go overhead.
-func diffFrames(prev, cur *image.RGBA) []Rect {
-	if prev == nil || cur == nil {
-		return nil
-	}
-	w, h := cur.Rect.Dx(), cur.Rect.Dy()
-	if prev.Rect.Dx() != w || prev.Rect.Dy() != h {
-		return nil // size changed → let caller do a full update
-	}
-	if len(prev.Pix) != len(cur.Pix) {
-		return nil
-	}
-
-	var rects []Rect
-	changed := func(rowOff, n int) bool {
-		// Compare n*4 bytes starting at rowOff as uint64 words.
-		// n is tile width in pixels (<=32).
-		words := (*[1 << 28]uint64)(unsafe.Pointer(&cur.Pix[rowOff]))
-		prevW := (*[1 << 28]uint64)(unsafe.Pointer(&prev.Pix[rowOff]))
-		for i := 0; i < n/2; i++ { // 4 bytes/pixel → 2 pixels per uint64
-			if words[i] != prevW[i] {
-				return true
-			}
-		}
-		return false
-	}
-
-	for ty := 0; ty < h; ty += dirtyTileSize {
-		tileH := dirtyTileSize
-		if ty+tileH > h {
-			tileH = h - ty
-		}
-		for tx := 0; tx < w; tx += dirtyTileSize {
-			tileW := dirtyTileSize
-			if tx+tileW > w {
-				tileW = w - tx
-			}
-			isDirty := false
-			for row := 0; row < tileH; row++ {
-				off := (ty+row)*cur.Stride + tx*4
-				if changed(off, tileW) {
-					isDirty = true
-					break
-				}
-			}
-			if isDirty {
-				rects = append(rects, Rect{X: tx, Y: ty, W: tileW, H: tileH})
-				if len(rects) >= maxDirtyRects {
-					return nil // too many → caller issues a full update
-				}
-			}
-		}
-	}
-	return rects
-}
-
 // SessionAwareCapturer captures the interactive desktop directly from a SYSTEM
 // service process (Session 0). It requires that setupInteractiveWindowStation()
 // has already been called to associate the process with WinSta0.
@@ -300,7 +227,7 @@ type SessionAwareCapturer struct {
 	mu        sync.Mutex
 	frame     *image.RGBA
 	prevFrame *image.RGBA // previous frame for dirty-rect comparison
-	dirty     []Rect      // dirty rectangles since the last CaptureDirty
+	dirty     []rfbcore.Rect // dirty rectangles since the last CaptureDirty
 	w, h      int
 }
 
@@ -341,7 +268,7 @@ func (c *SessionAwareCapturer) Capture() (*image.RGBA, error) {
 // changed since the previous call.  A nil slice means "send a full update"
 // (first frame, desktop/resolution change, or too many changes to tile well).
 // The dirty list is consumed: a subsequent call reports only new changes.
-func (c *SessionAwareCapturer) CaptureDirty() (*image.RGBA, []Rect, error) {
+func (c *SessionAwareCapturer) CaptureDirty() (*image.RGBA, []rfbcore.Rect, error) {
 	for {
 		c.mu.Lock()
 		img := c.frame
@@ -426,7 +353,7 @@ func (c *SessionAwareCapturer) loop() {
 		// Compute dirty rectangles against the previous frame.  When the
 		// desktop changed (different dimensions) prevFrame is nil, forcing a
 		// full update via diffFrames returning nil.
-		dirty := diffFrames(c.prevFrame, img)
+		dirty := rfbcore.DiffFrames(c.prevFrame, img)
 		c.frame = img
 		c.prevFrame = img
 		if dirty != nil {
