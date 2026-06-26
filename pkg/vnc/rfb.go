@@ -88,6 +88,11 @@ type session struct {
 
 	// encodings the client declared via SetEncodings.  Empty = only Raw(0).
 	clientEncodings []int32
+
+	// Tight tuning parsed from pseudo-encodings in SetEncodings: zlib level
+	// (1-9, default 6) and JPEG quality (0 = no JPEG; else 10-100).
+	tightLevel  int
+	jpegQuality int
 }
 
 func (s *session) addr() string { return s.conn.RemoteAddr().String() }
@@ -121,6 +126,7 @@ func (s *session) Serve() {
 	defer s.conn.Close()
 
 	s.initClientPixelFormat()
+	s.tightLevel = 6 // default Tight zlib level until the client hints otherwise
 
 	if err := s.handshake(); err != nil {
 		log.Printf("[%s] handshake: %v", s.addr(), err)
@@ -464,6 +470,20 @@ func (s *session) handleSetEncodings() error {
 	for i := uint16(0); i < numEnc; i++ {
 		encs[i] = int32(binary.BigEndian.Uint32(buf[i*4 : i*4+4]))
 	}
+	// Parse Tight tuning pseudo-encodings: JPEG quality -23 (high) .. -32 (low)
+	// and compression level -247 (high) .. -256 (low).
+	for _, e := range encs {
+		switch {
+		case e >= -32 && e <= -23:
+			s.jpegQuality = 100 - int(-23-e)*10 // -23 -> 100, -32 -> 10
+		case e >= -256 && e <= -247:
+			lvl := 9 - int(-247-e) // -247 -> 9, -256 -> 0
+			if lvl < 1 {
+				lvl = 1
+			}
+			s.tightLevel = lvl
+		}
+	}
 	s.encMu.Lock()
 	s.clientEncodings = encs
 	s.encMu.Unlock()
@@ -536,6 +556,8 @@ func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dir
 	useZlib := s.clientSupports(encZlib)
 	useCopyRect := s.clientSupports(encCopyRect)
 	pf := s.pixelFormat()
+	useTight := s.clientSupports(encTight)
+	useJPEG := useTight && s.jpegQuality > 0 && (pf.Bpp == 32 || pf.Bpp == 16)
 
 	// Build each rect (12-byte header + payload) up front so the message length
 	// is known before the single allocating write.
@@ -559,7 +581,21 @@ func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dir
 		parts = append(parts, p)
 	}
 	addPixels := func(x, y, w, h int) {
-		enc, payload := rfbcore.EncodeDirtyRect(img, rfbcore.Rect{X: x, Y: y, W: w, H: h}, stride, pf, useZlib)
+		rect := rfbcore.Rect{X: x, Y: y, W: w, H: h}
+		var enc int32
+		var payload []byte
+		// Prefer Tight (Fill/Basic-zlib/JPEG) when the client supports it and the
+		// rect is within Tight's 2048px width limit; fall back to Raw/Zlib on any
+		// failure or for over-wide rects.
+		if useTight && w <= 2048 {
+			if tp, err := rfbcore.EncodeTight(img, rect, stride, pf, s.tightLevel, useJPEG, s.jpegQuality); err == nil {
+				enc = encTight
+				payload = tp
+			}
+		}
+		if payload == nil {
+			enc, payload = rfbcore.EncodeDirtyRect(img, rect, stride, pf, useZlib)
+		}
 		var p rectPart
 		binary.BigEndian.PutUint16(p.hdr[0:2], uint16(x))
 		binary.BigEndian.PutUint16(p.hdr[2:4], uint16(y))
@@ -601,7 +637,7 @@ func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dir
 		off += len(p.payload)
 	}
 
-	log.Printf("[%s] >> FBU %d rects (%d bytes, zlib=%v, copyrect=%v)", s.addr(), len(parts), len(msg), useZlib, useCopyRect)
+	log.Printf("[%s] >> FBU %d rects (%d bytes, zlib=%v, copyrect=%v, tight=%v)", s.addr(), len(parts), len(msg), useZlib, useCopyRect, useTight)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.conn.Write(msg)
