@@ -33,7 +33,7 @@ const (
 	serverFramebufferUpdate = 0
 	serverCutText           = 3
 
-	encRaw     = 0
+	encRaw      = 0
 	encCopyRect = 1
 	encZlib     = 6
 	encTight    = 7
@@ -44,17 +44,17 @@ const (
 // RedShift=16 means: in the big-endian 32-bit word, red occupies bits 16-23
 // = byte offset 1 from the most-significant byte.
 var serverPixelFormat = [16]byte{
-	32,          // bits-per-pixel
-	24,          // depth
-	1,           // big-endian-flag  (1 = big-endian)
-	1,           // true-colour-flag
-	0, 255,      // red-max   (big-endian uint16 = 255)
-	0, 255,      // green-max
-	0, 255,      // blue-max
-	16,          // red-shift
-	8,           // green-shift
-	0,           // blue-shift
-	0, 0, 0,     // padding
+	32,     // bits-per-pixel
+	24,     // depth
+	1,      // big-endian-flag  (1 = big-endian)
+	1,      // true-colour-flag
+	0, 255, // red-max   (big-endian uint16 = 255)
+	0, 255, // green-max
+	0, 255, // blue-max
+	16,      // red-shift
+	8,       // green-shift
+	0,       // blue-shift
+	0, 0, 0, // padding
 }
 
 // session handles a single VNC client connection.
@@ -443,17 +443,17 @@ func (s *session) handleFBUpdateRequest() error {
 	// frozen), empty (nothing changed, tell the client to stop polling), or
 	// dirty (send just the changed rects).
 	if incremental == 1 {
-		img, dirty, full, err := s.capturer.CaptureDirty()
+		img, moves, dirty, full, err := s.capturer.CaptureDirty()
 		if err != nil {
 			return err
 		}
 		switch {
 		case full:
 			return s.sendFramebufferUpdate(img, 0, 0, s.serverW, s.serverH)
-		case len(dirty) == 0:
+		case len(moves) == 0 && len(dirty) == 0:
 			return s.sendEmptyUpdate()
 		default:
-			return s.sendDirtyUpdate(img, dirty)
+			return s.sendDirtyUpdate(img, moves, dirty)
 		}
 	}
 
@@ -480,47 +480,82 @@ func (s *session) sendEmptyUpdate() error {
 	return err
 }
 
-// sendDirtyUpdate sends a FramebufferUpdate containing only the changed
-// rectangles.  Each rectangle is encoded separately; when the client supports
-// zlib, pixel data is zlib-compressed (encoding 6), otherwise Raw(0).
-func (s *session) sendDirtyUpdate(img *image.RGBA, dirty []rfbcore.Rect) error {
+// sendDirtyUpdate sends a FramebufferUpdate containing CopyRect moves (when the
+// client supports it) plus dirty pixel rectangles. Each rect is encoded
+// separately; dirty pixel rects use zlib when the client supports it, otherwise
+// Raw (EncodeDirtyRect downgrades on zlib failure — CORR-1). A move whose client
+// lacks CopyRect support is sent as destination pixels instead.
+func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dirty []rfbcore.Rect) error {
 	stride := img.Stride
 	useZlib := s.clientSupports(encZlib)
+	useCopyRect := s.clientSupports(encCopyRect)
 	pf := s.pixelFormat()
 
-	// Build the whole message in one buffer: header + per-rect (12-byte hdr +
-	// pixel payload). EncodeDirtyRect handles zlib and downgrades to Raw on
-	// compression failure (CORR-1: never emit raw bytes under encZlib).
-	rectHdrs := make([][]byte, 0, len(dirty))
-	pixels := make([][]byte, 0, len(dirty))
-	totalLen := 4
+	// Build each rect (12-byte header + payload) up front so the message length
+	// is known before the single allocating write.
+	type rectPart struct {
+		hdr     [12]byte
+		payload []byte
+	}
+	parts := make([]rectPart, 0, len(moves)+len(dirty))
 
-	for _, r := range dirty {
-		enc, payload := rfbcore.EncodeDirtyRect(img, r, stride, pf, useZlib)
-		hdr := make([]byte, 12)
-		binary.BigEndian.PutUint16(hdr[0:2], uint16(r.X))
-		binary.BigEndian.PutUint16(hdr[2:4], uint16(r.Y))
-		binary.BigEndian.PutUint16(hdr[4:6], uint16(r.W))
-		binary.BigEndian.PutUint16(hdr[6:8], uint16(r.H))
-		binary.BigEndian.PutUint32(hdr[8:12], uint32(enc))
-		rectHdrs = append(rectHdrs, hdr)
-		pixels = append(pixels, payload)
-		totalLen += 12 + len(payload)
+	addCopyRect := func(mv rfbcore.CopyRect) {
+		var p rectPart
+		binary.BigEndian.PutUint16(p.hdr[0:2], uint16(mv.DstX))
+		binary.BigEndian.PutUint16(p.hdr[2:4], uint16(mv.DstY))
+		binary.BigEndian.PutUint16(p.hdr[4:6], uint16(mv.W))
+		binary.BigEndian.PutUint16(p.hdr[6:8], uint16(mv.H))
+		binary.BigEndian.PutUint32(p.hdr[8:12], uint32(encCopyRect))
+		payload := make([]byte, 4) // srcX, srcY (big-endian uint16 each)
+		binary.BigEndian.PutUint16(payload[0:2], uint16(mv.SrcX))
+		binary.BigEndian.PutUint16(payload[2:4], uint16(mv.SrcY))
+		p.payload = payload
+		parts = append(parts, p)
+	}
+	addPixels := func(x, y, w, h int) {
+		enc, payload := rfbcore.EncodeDirtyRect(img, rfbcore.Rect{X: x, Y: y, W: w, H: h}, stride, pf, useZlib)
+		var p rectPart
+		binary.BigEndian.PutUint16(p.hdr[0:2], uint16(x))
+		binary.BigEndian.PutUint16(p.hdr[2:4], uint16(y))
+		binary.BigEndian.PutUint16(p.hdr[4:6], uint16(w))
+		binary.BigEndian.PutUint16(p.hdr[6:8], uint16(h))
+		binary.BigEndian.PutUint32(p.hdr[8:12], uint32(enc))
+		p.payload = payload
+		parts = append(parts, p)
 	}
 
+	for _, mv := range moves {
+		if useCopyRect {
+			addCopyRect(mv)
+		} else {
+			addPixels(mv.DstX, mv.DstY, mv.W, mv.H) // no CopyRect: send dst pixels
+		}
+	}
+	for _, r := range dirty {
+		addPixels(r.X, r.Y, r.W, r.H)
+	}
+
+	if len(parts) == 0 {
+		return s.sendEmptyUpdate()
+	}
+
+	totalLen := 4
+	for _, p := range parts {
+		totalLen += 12 + len(p.payload)
+	}
 	msg := make([]byte, totalLen)
 	msg[0] = serverFramebufferUpdate
 	msg[1] = 0
-	binary.BigEndian.PutUint16(msg[2:4], uint16(len(dirty)))
+	binary.BigEndian.PutUint16(msg[2:4], uint16(len(parts)))
 	off := 4
-	for i := range dirty {
-		copy(msg[off:], rectHdrs[i])
+	for _, p := range parts {
+		copy(msg[off:], p.hdr[:])
 		off += 12
-		copy(msg[off:], pixels[i])
-		off += len(pixels[i])
+		copy(msg[off:], p.payload)
+		off += len(p.payload)
 	}
 
-	log.Printf("[%s] >> FBU dirty %d rects (%d bytes, zlib=%v)", s.addr(), len(dirty), len(msg), useZlib)
+	log.Printf("[%s] >> FBU %d rects (%d bytes, zlib=%v, copyrect=%v)", s.addr(), len(parts), len(msg), useZlib, useCopyRect)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.conn.Write(msg)

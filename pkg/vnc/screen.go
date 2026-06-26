@@ -16,10 +16,10 @@ import (
 )
 
 var (
-	gdi32         = windows.NewLazySystemDLL("gdi32.dll")
-	user32        = windows.NewLazySystemDLL("user32.dll")
-	procGetDC     = user32.NewProc("GetDC")
-	procReleaseDC = user32.NewProc("ReleaseDC")
+	gdi32                = windows.NewLazySystemDLL("gdi32.dll")
+	user32               = windows.NewLazySystemDLL("user32.dll")
+	procGetDC            = user32.NewProc("GetDC")
+	procReleaseDC        = user32.NewProc("ReleaseDC")
 	procCreateCompatDC   = gdi32.NewProc("CreateCompatibleDC")
 	procCreateDIBSection = gdi32.NewProc("CreateDIBSection")
 	procSelectObject     = gdi32.NewProc("SelectObject")
@@ -29,13 +29,13 @@ var (
 	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 
 	// Desktop / window-station management
-	procOpenInputDesktop        = user32.NewProc("OpenInputDesktop")
-	procSetThreadDesktop        = user32.NewProc("SetThreadDesktop")
-	procCloseDesktop            = user32.NewProc("CloseDesktop")
+	procOpenInputDesktop         = user32.NewProc("OpenInputDesktop")
+	procSetThreadDesktop         = user32.NewProc("SetThreadDesktop")
+	procCloseDesktop             = user32.NewProc("CloseDesktop")
 	procGetUserObjectInformation = user32.NewProc("GetUserObjectInformationW")
-	procOpenWindowStation       = user32.NewProc("OpenWindowStationW")
-	procSetProcessWindowStation = user32.NewProc("SetProcessWindowStation")
-	procCloseWindowStation      = user32.NewProc("CloseWindowStation")
+	procOpenWindowStation        = user32.NewProc("OpenWindowStationW")
+	procSetProcessWindowStation  = user32.NewProc("SetProcessWindowStation")
+	procCloseWindowStation       = user32.NewProc("CloseWindowStation")
 )
 
 const (
@@ -226,9 +226,10 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 type SessionAwareCapturer struct {
 	mu        sync.Mutex
 	frame     *image.RGBA
-	prevFrame *image.RGBA    // previous frame for dirty-rect comparison
-	dirty     []rfbcore.Rect // dirty rectangles since the last CaptureDirty
-	full      bool           // sticky: a full-frame update is pending until consumed
+	prevFrame *image.RGBA        // previous frame for dirty-rect comparison
+	dirty     []rfbcore.Rect     // dirty rectangles since the last CaptureDirty
+	moves     []rfbcore.CopyRect // CopyRect moves since the last CaptureDirty
+	full      bool               // sticky: a full-frame update is pending until consumed
 	w, h      int
 }
 
@@ -265,24 +266,26 @@ func (c *SessionAwareCapturer) Capture() (*image.RGBA, error) {
 	}
 }
 
-// CaptureDirty returns the latest frame, the dirty rectangles since the previous
-// call, and a full flag. full=true means "send the whole frame" (first frame,
-// desktop/resolution change, or too many changes to tile well); dirty will be
-// empty in that case. The dirty list and the full flag are consumed: a
+// CaptureDirty returns the latest frame, the CopyRect moves and dirty rectangles
+// since the previous call, and a full flag. full=true means "send the whole
+// frame" (first frame, desktop/resolution change, or too many changes to tile
+// well); moves and dirty will be empty in that case. All three are consumed: a
 // subsequent call reports only new changes.
-func (c *SessionAwareCapturer) CaptureDirty() (*image.RGBA, []rfbcore.Rect, bool, error) {
+func (c *SessionAwareCapturer) CaptureDirty() (*image.RGBA, []rfbcore.CopyRect, []rfbcore.Rect, bool, error) {
 	for {
 		c.mu.Lock()
 		img := c.frame
 		c.mu.Unlock()
 		if img != nil {
 			c.mu.Lock()
+			moves := c.moves
 			dirty := c.dirty
 			full := c.full
-			c.dirty = nil // consume; next call reports fresh changes only
+			c.moves = nil // consume; next call reports fresh changes only
+			c.dirty = nil
 			c.full = false
 			c.mu.Unlock()
-			return img, dirty, full, nil
+			return img, moves, dirty, full, nil
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -362,13 +365,19 @@ func (c *SessionAwareCapturer) loop() {
 		// reads it (CaptureDirty), so a one-shot full-screen change is never
 		// lost when the very next frame happens to be identical to it.
 		dirty, full := rfbcore.DiffFrames(c.prevFrame, img)
+		prev := c.prevFrame // detect moves against this frame before overwriting it
 		c.frame = img
 		c.prevFrame = img
 		if full {
 			c.full = true
 			c.dirty = nil
+			c.moves = nil
 		} else if !c.full {
-			c.dirty = rfbcore.CoalesceRects(dirty)
+			// Detect CopyRect moves on the raw tile-aligned dirty list, then
+			// coalesce the genuinely-changed remainder.
+			moves, realDirty := rfbcore.DetectMoves(prev, img, dirty)
+			c.moves = moves
+			c.dirty = rfbcore.CoalesceRects(realDirty)
 		}
 		changed = full || len(dirty) > 0
 		c.mu.Unlock()

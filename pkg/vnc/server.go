@@ -73,11 +73,11 @@ type ScreenCapturer interface {
 	Width() int
 	Height() int
 	Capture() (*image.RGBA, error)
-	// CaptureDirty returns the current frame, the dirty rectangles since the
-	// last call, and a full flag — when full is true the caller must send the
-	// whole frame (too many changes / first frame / resize) instead of the
-	// dirty rects (which will be empty).
-	CaptureDirty() (*image.RGBA, []rfbcore.Rect, bool, error)
+	// CaptureDirty returns the current frame, the CopyRect moves and dirty
+	// rectangles since the last call, and a full flag — when full is true the
+	// caller must send the whole frame (too many changes / first frame / resize)
+	// instead of the moves/dirty rects (which will be empty).
+	CaptureDirty() (*image.RGBA, []rfbcore.CopyRect, []rfbcore.Rect, bool, error)
 }
 
 // InputInjector is the interface used by the RFB session to deliver
@@ -144,10 +144,10 @@ func (l *LocalInput) InjectPointer(buttonMask uint8, x, y, serverW, serverH int)
 
 // inputCmd is an input event queued to the DesktopAwareInput worker.
 type inputCmd struct {
-	isKey               bool
-	keysym              uint32
-	down                bool
-	buttonMask          uint8
+	isKey                  bool
+	keysym                 uint32
+	down                   bool
+	buttonMask             uint8
 	x, y, serverW, serverH int
 }
 
@@ -305,4 +305,3 @@ func (s *Server) serveVNC(ln net.Listener, capturer ScreenCapturer, input InputI
 		go sess.Serve()
 	}
 }
-

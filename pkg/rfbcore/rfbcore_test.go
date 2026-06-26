@@ -142,6 +142,62 @@ func TestCoalesceRects(t *testing.T) {
 	}
 }
 
+func TestDetectMovesTranslatedBlock(t *testing.T) {
+	// 128x32 frame (4 tiles). prev has a non-uniform gradient block at tile
+	// (0,0); cur has the SAME gradient at tile (64,0). Tile (0,0) is now solid
+	// background. DiffFrames reports both (0,0) and (64,0) dirty.
+	w, h := 128, 32
+	paint := func(img *image.RGBA, ox int) {
+		for x := 0; x < 32; x++ {
+			for y := 0; y < 32; y++ {
+				img.Set(ox+x, y, color.RGBA{R: uint8(x), G: uint8(y), B: 50, A: 255})
+			}
+		}
+	}
+	prev := image.NewRGBA(image.Rect(0, 0, w, h))
+	paint(prev, 0)
+	cur := image.NewRGBA(prev.Rect)
+	paint(cur, 64)
+
+	dirty, _ := DiffFrames(prev, cur) // tiles (0,0) [gradient gone] and (64,0) [gradient appeared]
+	moves, realDirty := DetectMoves(prev, cur, dirty)
+
+	if len(moves) != 1 {
+		t.Fatalf("moves=%+v, want exactly 1 (gradient moved 0,0 -> 64,0)", moves)
+	}
+	m := moves[0]
+	if m.SrcX != 0 || m.SrcY != 0 || m.DstX != 64 || m.DstY != 0 || m.W != 32 || m.H != 32 {
+		t.Fatalf("move=%+v, want Src(0,0)->Dst(64,0) 32x32", m)
+	}
+	// The vacated source tile (0,0) is now solid background -> reported as
+	// realDirty (NOT a spurious background "move").
+	if len(realDirty) != 1 || realDirty[0] != (Rect{0, 0, 32, 32}) {
+		t.Fatalf("realDirty=%+v, want [{0 0 32 32}] (vacated source)", realDirty)
+	}
+}
+
+func TestDetectMovesNoMatchIsAllDirty(t *testing.T) {
+	// A genuinely new non-uniform tile with no identical prev tile -> all dirty.
+	prev := image.NewRGBA(image.Rect(0, 0, 64, 32))
+	cur := image.NewRGBA(prev.Rect)
+	for x := 0; x < 32; x++ {
+		cur.Set(x, 0, color.RGBA{R: uint8(x + 1), A: 255})
+	}
+	dirty, _ := DiffFrames(prev, cur)
+	moves, realDirty := DetectMoves(prev, cur, dirty)
+	if len(moves) != 0 || len(realDirty) != 1 {
+		t.Fatalf("no-match: moves=%d realDirty=%d, want 0/1", len(moves), len(realDirty))
+	}
+}
+
+func TestDetectMovesNilFrames(t *testing.T) {
+	// Nil prev/cur -> no moves, dirty returned unchanged.
+	dirty := []Rect{{0, 0, 32, 32}}
+	if moves, realDirty := DetectMoves(nil, nil, dirty); len(moves) != 0 || len(realDirty) != 1 {
+		t.Fatalf("nil frames: moves=%d realDirty=%d, want 0/1", len(moves), len(realDirty))
+	}
+}
+
 func TestPixelFormatBytesPerPixel(t *testing.T) {
 	cases := []struct {
 		bpp  uint8
