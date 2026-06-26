@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"io"
 	"testing"
 )
@@ -308,6 +309,149 @@ func TestEncodeRectPixelsUses565FastPath(t *testing.T) {
 	out := EncodeRectPixels(img, 0, 0, 1, 1, img.Stride, PixelFormat565) // PixelFormat565 is big-endian
 	if len(out) != 2 || out[0] != 0xF8 || out[1] != 0x00 {
 		t.Fatalf("565 out=% x, want [f8 00]", out)
+	}
+}
+
+func TestEncodeCompactLen(t *testing.T) {
+	for _, n := range []int{0, 1, 127, 128, 255, 10000, 16383, 16384, 100000} {
+		got := encodeCompactLen(n)
+		v, used := decodeCompactLen(got)
+		if used != len(got) || v != n {
+			t.Errorf("n=%d: round-trip v=%d used=%d enc=% x", n, v, used, got)
+		}
+	}
+	// Spec vector: 10000 -> 90 4E.
+	if got := encodeCompactLen(10000); !bytes.Equal(got, []byte{0x90, 0x4E}) {
+		t.Fatalf("10000 = % x, want 90 4e", got)
+	}
+}
+
+var tightCanonicalPF = PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+
+func TestEncodeTightFill(t *testing.T) {
+	// Uniform 4x4 red -> FillCompression: 0x81 + 3-byte TPIXEL (ff 00 00).
+	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			img.Set(x, y, color.RGBA{R: 255, A: 255})
+		}
+	}
+	out := EncodeTightFill(img, Rect{0, 0, 4, 4}, img.Stride, tightCanonicalPF)
+	want := []byte{0x81, 0xff, 0x00, 0x00}
+	if !bytes.Equal(out, want) {
+		t.Fatalf("fill = % x, want % x", out, want)
+	}
+}
+
+func TestEncodeTightBasicRawSmall(t *testing.T) {
+	// 1x1 red -> filtered size 3 (<12) -> raw, control 0x01.
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	out, err := EncodeTightBasic(img, Rect{0, 0, 1, 1}, img.Stride, tightCanonicalPF, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x01, 0xff, 0x00, 0x00}
+	if !bytes.Equal(out, want) {
+		t.Fatalf("basic raw = % x, want % x", out, want)
+	}
+}
+
+func TestEncodeTightBasicZlibLarge(t *testing.T) {
+	// 8x8 gradient -> 64*3 = 192 bytes >= 12 -> zlib path.
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 30), G: uint8(y * 30), B: 7, A: 255})
+		}
+	}
+	out, err := EncodeTightBasic(img, Rect{0, 0, 8, 8}, img.Stride, tightCanonicalPF, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[0] != 0x01 {
+		t.Fatalf("control=%#x, want 0x01", out[0])
+	}
+	n, used := decodeCompactLen(out[1:])
+	zr, err := zlib.NewReader(bytes.NewReader(out[1+used : 1+used+n]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	round, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(round) != 192 {
+		t.Fatalf("decompressed len=%d, want 192", len(round))
+	}
+	// spot-check pixel (1,0): R=30,G=0,B=7 -> TPIXEL [1e 00 07].
+	if round[3] != 0x1e || round[4] != 0x00 || round[5] != 0x07 {
+		t.Fatalf("pixel(1,0) = % x, want 1e 00 07", round[3:6])
+	}
+}
+
+func TestEncodeTightJPEG(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 16; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 16), G: uint8(y * 16), B: 128, A: 255})
+		}
+	}
+	out, err := EncodeTightJPEG(img, Rect{0, 0, 16, 16}, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[0] != 0x90 {
+		t.Fatalf("control=%#x, want 0x90 (jpeg)", out[0])
+	}
+	n, used := decodeCompactLen(out[1:])
+	im, err := jpeg.Decode(bytes.NewReader(out[1+used : 1+used+n]))
+	if err != nil {
+		t.Fatalf("jpeg.Decode: %v", err)
+	}
+	b := im.Bounds()
+	if b.Dx() != 16 || b.Dy() != 16 {
+		t.Fatalf("jpeg dims=%v, want 16x16", b)
+	}
+}
+
+func TestEncodeTightDispatcherFillAndBasic(t *testing.T) {
+	// Uniform -> dispatcher picks Fill (0x81).
+	uniform := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			uniform.Set(x, y, color.RGBA{G: 200, A: 255})
+		}
+	}
+	out, err := EncodeTight(uniform, Rect{0, 0, 4, 4}, uniform.Stride, tightCanonicalPF, 6, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[0] != 0x81 {
+		t.Fatalf("uniform dispatcher control=%#x, want 0x81 (fill)", out[0])
+	}
+
+	// Non-uniform large -> basic zlib (control 0x01), no JPEG requested.
+	grad := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			grad.Set(x, y, color.RGBA{R: uint8(x * 30), G: uint8(y * 30), A: 255})
+		}
+	}
+	out, err = EncodeTight(grad, Rect{0, 0, 8, 8}, grad.Stride, tightCanonicalPF, 6, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[0] != 0x01 {
+		t.Fatalf("non-uniform dispatcher control=%#x, want 0x01 (basic)", out[0])
+	}
+}
+
+func TestEncodeTightWideRectErrors(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 2049, 1))
+	if _, err := EncodeTight(img, Rect{0, 0, 2049, 1}, img.Stride, tightCanonicalPF, 6, false, 0); err == nil {
+		t.Fatal("expected error for width > 2048")
 	}
 }
 
