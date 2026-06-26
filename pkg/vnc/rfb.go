@@ -438,19 +438,23 @@ func (s *session) handleFBUpdateRequest() error {
 
 	s.syncDims()
 
-	// Incremental requests with nothing changed: send an empty update so the
-	// client stops asking until the next change.  This is what makes a static
-	// desktop consume ~0 bandwidth instead of re-sending the full frame.
+	// Incremental request: ask the capturer what changed. Three outcomes —
+	// full (deliver the whole frame so full-screen motion is visible, not
+	// frozen), empty (nothing changed, tell the client to stop polling), or
+	// dirty (send just the changed rects).
 	if incremental == 1 {
-		img, dirty, err := s.capturer.CaptureDirty()
+		img, dirty, full, err := s.capturer.CaptureDirty()
 		if err != nil {
 			return err
 		}
-		if len(dirty) == 0 {
-			// No changes since last frame → empty FramebufferUpdate.
+		switch {
+		case full:
+			return s.sendFramebufferUpdate(img, 0, 0, s.serverW, s.serverH)
+		case len(dirty) == 0:
 			return s.sendEmptyUpdate()
+		default:
+			return s.sendDirtyUpdate(img, dirty)
 		}
-		return s.sendDirtyUpdate(img, dirty)
 	}
 
 	// Non-incremental (full) request: send the whole requested rectangle.

@@ -226,8 +226,9 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 type SessionAwareCapturer struct {
 	mu        sync.Mutex
 	frame     *image.RGBA
-	prevFrame *image.RGBA // previous frame for dirty-rect comparison
+	prevFrame *image.RGBA    // previous frame for dirty-rect comparison
 	dirty     []rfbcore.Rect // dirty rectangles since the last CaptureDirty
+	full      bool           // sticky: a full-frame update is pending until consumed
 	w, h      int
 }
 
@@ -264,11 +265,12 @@ func (c *SessionAwareCapturer) Capture() (*image.RGBA, error) {
 	}
 }
 
-// CaptureDirty returns the latest frame along with the list of rectangles that
-// changed since the previous call.  A nil slice means "send a full update"
-// (first frame, desktop/resolution change, or too many changes to tile well).
-// The dirty list is consumed: a subsequent call reports only new changes.
-func (c *SessionAwareCapturer) CaptureDirty() (*image.RGBA, []rfbcore.Rect, error) {
+// CaptureDirty returns the latest frame, the dirty rectangles since the previous
+// call, and a full flag. full=true means "send the whole frame" (first frame,
+// desktop/resolution change, or too many changes to tile well); dirty will be
+// empty in that case. The dirty list and the full flag are consumed: a
+// subsequent call reports only new changes.
+func (c *SessionAwareCapturer) CaptureDirty() (*image.RGBA, []rfbcore.Rect, bool, error) {
 	for {
 		c.mu.Lock()
 		img := c.frame
@@ -276,9 +278,11 @@ func (c *SessionAwareCapturer) CaptureDirty() (*image.RGBA, []rfbcore.Rect, erro
 		if img != nil {
 			c.mu.Lock()
 			dirty := c.dirty
+			full := c.full
 			c.dirty = nil // consume; next call reports fresh changes only
+			c.full = false
 			c.mu.Unlock()
-			return img, dirty, nil
+			return img, dirty, full, nil
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -351,24 +355,22 @@ func (c *SessionAwareCapturer) loop() {
 
 		// CORR-3: capture the adaptive-FPS decision inside the lock — the old
 		// code read c.dirty after Unlock, racing with CaptureDirty consumers.
-		needFull := false
-		hasDirty := false
+		changed := false
 		c.mu.Lock()
-		// Compute dirty rectangles against the previous frame.  When the
-		// desktop changed (different dimensions) prevFrame is nil, forcing a
-		// full update via DiffFrames returning nil.
-		dirty := rfbcore.DiffFrames(c.prevFrame, img)
+		// Three-state diff: (nil,false)=no change, (rects,false)=dirty,
+		// (nil,true)=full update needed. "full" is sticky until a consumer
+		// reads it (CaptureDirty), so a one-shot full-screen change is never
+		// lost when the very next frame happens to be identical to it.
+		dirty, full := rfbcore.DiffFrames(c.prevFrame, img)
 		c.frame = img
 		c.prevFrame = img
-		if dirty != nil {
-			c.dirty = dirty
-			hasDirty = len(dirty) > 0
-		} else {
-			// nil == full-frame update needed (first frame, resize, or
-			// too many small changes).
+		if full {
+			c.full = true
 			c.dirty = nil
-			needFull = true
+		} else if !c.full {
+			c.dirty = rfbcore.CoalesceRects(dirty)
 		}
+		changed = full || len(dirty) > 0
 		c.mu.Unlock()
 
 		// Adaptive frame rate: stay at full 30 fps while the screen is
@@ -380,7 +382,7 @@ func (c *SessionAwareCapturer) loop() {
 		if staticFrames > 3 {
 			delay = 100 * time.Millisecond // static → ~10 fps
 		}
-		if hasDirty || needFull {
+		if changed {
 			staticFrames = 0
 		}
 		time.Sleep(delay)

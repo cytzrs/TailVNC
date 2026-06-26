@@ -54,50 +54,91 @@ func TestVncAuthEncryptErrors(t *testing.T) {
 	}
 }
 
-func TestDiffFrames(t *testing.T) {
+func TestDiffFramesThreeStates(t *testing.T) {
+	// DiffFrames is three-state: (nil,false)=no change, ([...],false)=dirty,
+	// (nil,true)=full update needed. The full state is what un-freezes full-screen
+	// motion (previously indistinguishable from "no change" -> empty update -> freeze).
 	w, h := 64, 64
 	prev := image.NewRGBA(image.Rect(0, 0, w, h))
-	cur := image.NewRGBA(image.Rect(0, 0, w, h))
 
-	// Identical frames -> no dirty rects.
-	if got := DiffFrames(prev, cur); len(got) != 0 {
-		t.Fatalf("identical frames: got %d rects, want 0", len(got))
+	// (nil, false): identical frames = no change.
+	cur := image.NewRGBA(prev.Rect)
+	if rects, full := DiffFrames(prev, cur); full || len(rects) != 0 {
+		t.Fatalf("identical: rects=%v full=%v, want empty/not-full", rects, full)
 	}
 
-	// Change one pixel at (1,1) -> exactly one tile rect covers it.
+	// ([...], false): one pixel changed = one dirty tile, geometry aligned to the grid.
 	cur.Set(1, 1, color.RGBA{R: 255, A: 255})
-	got := DiffFrames(prev, cur)
-	if len(got) != 1 {
-		t.Fatalf("single-pixel change: got %d rects, want 1", len(got))
+	rects, full := DiffFrames(prev, cur)
+	if full || len(rects) != 1 {
+		t.Fatalf("one tile: rects=%v full=%v, want 1 dirty / not-full", rects, full)
 	}
-	r := got[0]
-	if r.X != 0 || r.Y != 0 || r.W != DirtyTileSize || r.H != DirtyTileSize {
-		t.Fatalf("tile rect = %+v, want {0 0 %d %d}", r, DirtyTileSize, DirtyTileSize)
-	}
-
-	// nil prev -> nil (signals full update to caller).
-	if DiffFrames(nil, cur) != nil {
-		t.Fatal("nil prev should return nil")
+	if got := rects[0]; got != (Rect{0, 0, DirtyTileSize, DirtyTileSize}) {
+		t.Fatalf("tile rect = %+v, want {0 0 %d %d}", got, DirtyTileSize, DirtyTileSize)
 	}
 
-	// Different size -> nil.
+	// (nil, true): nil prev = full update (NOT "no change").
+	if rects, full := DiffFrames(nil, cur); !full || rects != nil {
+		t.Fatalf("nil prev: rects=%v full=%v, want nil/full", rects, full)
+	}
+
+	// (nil, true): size mismatch = full update.
 	big := image.NewRGBA(image.Rect(0, 0, 128, 128))
-	if DiffFrames(prev, big) != nil {
-		t.Fatal("size mismatch should return nil")
+	if rects, full := DiffFrames(prev, big); !full || rects != nil {
+		t.Fatalf("size mismatch: rects=%v full=%v, want nil/full", rects, full)
 	}
 }
 
 func TestDiffFramesCollapseOnTooMany(t *testing.T) {
-	// MaxDirtyRects+1 disjoint tiles dirty -> returns nil (caller issues full update).
-	w := DirtyTileSize * (MaxDirtyRects + 1)
-	h := DirtyTileSize
-	prev := image.NewRGBA(image.Rect(0, 0, w, h))
-	cur := image.NewRGBA(image.Rect(0, 0, w, h))
-	for tx := 0; tx < w; tx += DirtyTileSize {
+	// More than MaxDirtyRects disjoint tiles dirty -> (nil, true): caller must issue
+	// a FULL update (delivers content), not an empty one (which froze the screen).
+	bigW := DirtyTileSize * (MaxDirtyRects + 1)
+	prev := image.NewRGBA(image.Rect(0, 0, bigW, DirtyTileSize))
+	cur := image.NewRGBA(prev.Rect)
+	for tx := 0; tx < bigW; tx += DirtyTileSize {
 		cur.Set(tx, 0, color.RGBA{G: 255, A: 255})
 	}
-	if got := DiffFrames(prev, cur); got != nil {
-		t.Fatalf("too many dirty tiles: got %d rects, want nil (full update)", len(got))
+	rects, full := DiffFrames(prev, cur)
+	if !full || rects != nil {
+		t.Fatalf("too many dirty tiles: rects=%v full=%v, want nil/full", rects, full)
+	}
+
+	// Exactly MaxDirtyRects dirty tiles stays under the cap -> dirty, not full.
+	capPrev := image.NewRGBA(image.Rect(0, 0, DirtyTileSize*MaxDirtyRects, DirtyTileSize))
+	capCur := image.NewRGBA(capPrev.Rect)
+	for tx := 0; tx < capCur.Rect.Dx(); tx += DirtyTileSize {
+		capCur.Set(tx, 0, color.RGBA{G: 255, A: 255})
+	}
+	rects, full = DiffFrames(capPrev, capCur)
+	if full || rects == nil || len(rects) != MaxDirtyRects {
+		t.Fatalf("at-cap: rects=%d full=%v, want %d dirty / not-full", len(rects), full, MaxDirtyRects)
+	}
+}
+
+func TestCoalesceRects(t *testing.T) {
+	// Two horizontally-adjacent 32x32 tiles merge into one 64x32 rect.
+	got := CoalesceRects([]Rect{{0, 0, 32, 32}, {32, 0, 32, 32}})
+	if len(got) != 1 || got[0] != (Rect{0, 0, 64, 32}) {
+		t.Fatalf("adjacent merge: got %+v, want [{0 0 64 32}]", got)
+	}
+	// Two vertically-adjacent tiles merge into one 32x64 rect.
+	got = CoalesceRects([]Rect{{0, 0, 32, 32}, {0, 32, 32, 32}})
+	if len(got) != 1 || got[0] != (Rect{0, 0, 32, 64}) {
+		t.Fatalf("vertical merge: got %+v, want [{0 0 32 64}]", got)
+	}
+	// Two far-apart rects do NOT merge (waste guard).
+	far := CoalesceRects([]Rect{{0, 0, 32, 32}, {1000, 1000, 32, 32}})
+	if len(far) != 2 {
+		t.Fatalf("far apart: got %d rects, want 2", len(far))
+	}
+	// Empty input -> empty output, no panic.
+	if got := CoalesceRects(nil); len(got) != 0 {
+		t.Fatalf("nil input: got %+v, want empty", got)
+	}
+	// A chain of adjacent tiles collapses to its bounding box.
+	chain := CoalesceRects([]Rect{{0, 0, 32, 32}, {32, 0, 32, 32}, {64, 0, 32, 32}})
+	if len(chain) != 1 || chain[0] != (Rect{0, 0, 96, 32}) {
+		t.Fatalf("chain merge: got %+v, want [{0 0 96 32}]", chain)
 	}
 }
 
