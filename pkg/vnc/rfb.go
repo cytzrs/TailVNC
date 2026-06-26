@@ -566,17 +566,113 @@ func (s *session) sendEmptyUpdate() error {
 // rect fits Tight's 2048px width limit; otherwise zlib (RFC 6143
 // length-prefixed) when supported; otherwise Raw. EncodeDirtyRect downgrades to
 // Raw on zlib failure (CORR-1), so a failure never corrupts the stream.
+// rectPart is one wire rectangle: a 12-byte RFB rect header plus its encoding
+// payload. A single logical framebuffer rectangle can expand into several
+// rectParts — notably when the client only advertises Tight, whose rectangles
+// are capped at 2048px wide, so a 2560px-wide full frame is split into vertical
+// strips. Shared by sendFramebufferUpdate and sendDirtyUpdate.
+type rectPart struct {
+	hdr     [12]byte
+	payload []byte
+}
+
+// encodePixelRect encodes one logical rectangle and returns the single rect
+// part it produces. Kept for callers that can emit only one rect; the full-frame
+// and dirty paths use encodePixelRects so a >2048px Tight rect is striped.
 func (s *session) encodePixelRect(img *image.RGBA, x, y, w, h int) (enc int32, payload []byte) {
-	rect := rfbcore.Rect{X: x, Y: y, W: w, H: h}
-	stride := img.Stride
+	parts := s.encodePixelRects(img, x, y, w, h)
+	if len(parts) == 1 {
+		return int32(binary.BigEndian.Uint32(parts[0].hdr[8:12])), parts[0].payload
+	}
+	// Should not happen for a single in-bounds rect, but stay safe.
+	return rfbcore.EncodeDirtyRect(img, rfbcore.Rect{X: x, Y: y, W: w, H: h}, img.Stride, s.pixelFormat(), s.clientSupports(encZlib), s.getZlibStream())
+}
+
+// encodePixelRects encodes one logical pixel rectangle into one or more wire
+// rects, honouring the client's negotiated encodings. Tight (Fill/Basic-zlib/
+// JPEG) is preferred when the client supports it; because Tight caps each rect
+// at 2048px wide (rfbproto.rst), a wider rectangle is split into vertical strips
+// of <= 2048px, each emitted as its own Tight rect. This is what stops a
+// 2560px-wide full frame from falling through to a 12 MB Raw rect (PERF/RFB:
+// the previous code gated Tight on w<=2048, so any over-wide rect silently
+// became Raw regardless of what the client advertised).
+//
+// Falls back to zlib (RFC 6143 length-prefixed, persistent stream) then Raw.
+func (s *session) encodePixelRects(img *image.RGBA, x, y, w, h int) []rectPart {
 	pf := s.pixelFormat()
-	if s.clientSupports(encTight) && w <= 2048 {
-		useJPEG := s.jpegQuality > 0 && (pf.Bpp == 32 || pf.Bpp == 16)
-		if tp, err := rfbcore.EncodeTight(img, rect, stride, pf, s.tightLevel, useJPEG, s.jpegQuality); err == nil {
-			return encTight, tp
+	stride := img.Stride
+	useJPEG := s.jpegQuality > 0 && (pf.Bpp == 32 || pf.Bpp == 16)
+
+	if s.clientSupports(encTight) {
+		const tightMaxW = 2048
+		parts := make([]rectPart, 0, (w+tightMaxW-1)/tightMaxW)
+		for sx := x; sx < x+w; sx += tightMaxW {
+			sw := tightMaxW
+			if sx+sw > x+w {
+				sw = x + w - sx
+			}
+			rect := rfbcore.Rect{X: sx, Y: y, W: sw, H: h}
+			tp, err := rfbcore.EncodeTight(img, rect, stride, pf, s.tightLevel, useJPEG, s.jpegQuality)
+			if err != nil {
+				// Tight failed for this strip -> abandon Tight entirely and fall
+				// through to the zlib/raw single-rect path below.
+				break
+			}
+			var p rectPart
+			binary.BigEndian.PutUint16(p.hdr[0:2], uint16(sx))
+			binary.BigEndian.PutUint16(p.hdr[2:4], uint16(y))
+			binary.BigEndian.PutUint16(p.hdr[4:6], uint16(sw))
+			binary.BigEndian.PutUint16(p.hdr[6:8], uint16(h))
+			binary.BigEndian.PutUint32(p.hdr[8:12], uint32(encTight))
+			p.payload = tp
+			parts = append(parts, p)
+		}
+		if len(parts) > 0 {
+			return parts
 		}
 	}
-	return rfbcore.EncodeDirtyRect(img, rect, stride, pf, s.clientSupports(encZlib), s.getZlibStream())
+
+	enc, payload := rfbcore.EncodeDirtyRect(img, rfbcore.Rect{X: x, Y: y, W: w, H: h}, stride, pf, s.clientSupports(encZlib), s.getZlibStream())
+	var p rectPart
+	binary.BigEndian.PutUint16(p.hdr[0:2], uint16(x))
+	binary.BigEndian.PutUint16(p.hdr[2:4], uint16(y))
+	binary.BigEndian.PutUint16(p.hdr[4:6], uint16(w))
+	binary.BigEndian.PutUint16(p.hdr[6:8], uint16(h))
+	binary.BigEndian.PutUint32(p.hdr[8:12], uint32(enc))
+	p.payload = payload
+	return []rectPart{p}
+}
+
+// writeUpdate assembles a FramebufferUpdate message from the given rect parts and
+// writes it atomically under writeMu. Shared by sendFramebufferUpdate and
+// sendDirtyUpdate so both paths emit identically-framed updates.
+func (s *session) writeUpdate(parts []rectPart) error {
+	if len(parts) == 0 {
+		return s.sendEmptyUpdate()
+	}
+	totalLen := 4
+	for _, p := range parts {
+		totalLen += 12 + len(p.payload)
+	}
+	msg := make([]byte, totalLen)
+	msg[0] = serverFramebufferUpdate
+	msg[1] = 0
+	binary.BigEndian.PutUint16(msg[2:4], uint16(len(parts)))
+	off := 4
+	for _, p := range parts {
+		copy(msg[off:], p.hdr[:])
+		off += 12
+		copy(msg[off:], p.payload)
+		off += len(p.payload)
+	}
+	log.Printf("[%s] >> FBU %d rects (%d bytes)", s.addr(), len(parts), len(msg))
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.conn.Write(msg)
+	if err != nil {
+		log.Printf("[%s]    write error: %v", s.addr(), err)
+	}
+	return err
 }
 
 // sendDirtyUpdate sends a FramebufferUpdate containing CopyRect moves (when the
@@ -585,16 +681,12 @@ func (s *session) encodePixelRect(img *image.RGBA, x, y, w, h int) (enc int32, p
 // Raw (EncodeDirtyRect downgrades on zlib failure — CORR-1). A move whose client
 // lacks CopyRect support is sent as destination pixels instead.
 func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dirty []rfbcore.Rect) error {
-	useZlib := s.clientSupports(encZlib)
 	useCopyRect := s.clientSupports(encCopyRect)
-	useTight := s.clientSupports(encTight)
 
-	// Build each rect (12-byte header + payload) up front so the message length
-	// is known before the single allocating write.
-	type rectPart struct {
-		hdr     [12]byte
-		payload []byte
-	}
+	// Build each rect (12-byte header + payload) up front. Dirty/move rects are
+	// already small (<= DirtyTileSize / detected moves), so they rarely need
+	// strip-splitting, but encodePixelRects handles over-wide rects (e.g. a
+	// coalesced dirty rect or a >2048px move) identically to the full-frame path.
 	parts := make([]rectPart, 0, len(moves)+len(dirty))
 
 	addCopyRect := func(mv rfbcore.CopyRect) {
@@ -611,15 +703,7 @@ func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dir
 		parts = append(parts, p)
 	}
 	addPixels := func(x, y, w, h int) {
-		enc, payload := s.encodePixelRect(img, x, y, w, h)
-		var p rectPart
-		binary.BigEndian.PutUint16(p.hdr[0:2], uint16(x))
-		binary.BigEndian.PutUint16(p.hdr[2:4], uint16(y))
-		binary.BigEndian.PutUint16(p.hdr[4:6], uint16(w))
-		binary.BigEndian.PutUint16(p.hdr[6:8], uint16(h))
-		binary.BigEndian.PutUint32(p.hdr[8:12], uint32(enc))
-		p.payload = payload
-		parts = append(parts, p)
+		parts = append(parts, s.encodePixelRects(img, x, y, w, h)...)
 	}
 
 	for _, mv := range moves {
@@ -633,31 +717,7 @@ func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dir
 		addPixels(r.X, r.Y, r.W, r.H)
 	}
 
-	if len(parts) == 0 {
-		return s.sendEmptyUpdate()
-	}
-
-	totalLen := 4
-	for _, p := range parts {
-		totalLen += 12 + len(p.payload)
-	}
-	msg := make([]byte, totalLen)
-	msg[0] = serverFramebufferUpdate
-	msg[1] = 0
-	binary.BigEndian.PutUint16(msg[2:4], uint16(len(parts)))
-	off := 4
-	for _, p := range parts {
-		copy(msg[off:], p.hdr[:])
-		off += 12
-		copy(msg[off:], p.payload)
-		off += len(p.payload)
-	}
-
-	log.Printf("[%s] >> FBU %d rects (%d bytes, zlib=%v, copyrect=%v, tight=%v)", s.addr(), len(parts), len(msg), useZlib, useCopyRect, useTight)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err := s.conn.Write(msg)
-	return err
+	return s.writeUpdate(parts)
 }
 
 func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
@@ -672,43 +732,14 @@ func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
 		return nil
 	}
 
-	// Encode the single rect with the client's negotiated encoding (Tight when
-	// supported, else zlib, else Raw) — same selection as sendDirtyUpdate, via
-	// the shared encodePixelRect helper. The previous implementation hardcoded
-	// encRaw, so a 2560x1172 32-bpp frame left the wire as ~12 MB uncompressed
-	// on every non-incremental request and every CaptureDirty full-degradation,
-	// saturating the link and tripping the 30 s read deadline (i/o timeout).
-	enc, payload := s.encodePixelRect(img, x, y, w, h)
-
-	msg := make([]byte, 4+12+len(payload))
-	// FramebufferUpdate header: type(1) + padding(1) + numRects(2)
-	msg[0] = serverFramebufferUpdate
-	msg[1] = 0
-	binary.BigEndian.PutUint16(msg[2:4], 1)
-
-	// Rectangle header: x(2)+y(2)+w(2)+h(2)+encoding(4)
-	binary.BigEndian.PutUint16(msg[4:6], uint16(x))
-	binary.BigEndian.PutUint16(msg[6:8], uint16(y))
-	binary.BigEndian.PutUint16(msg[8:10], uint16(w))
-	binary.BigEndian.PutUint16(msg[10:12], uint16(h))
-	binary.BigEndian.PutUint32(msg[12:16], uint32(enc))
-	copy(msg[16:], payload)
-
-	// ZLIB-FIX 诊断：enc=6(Zlib) 时打印长度前缀+首字节，便于核对持久流
-	loghead := "[%s] >> FBU %dx%d enc=%d (%d bytes)"
-	logargs := []interface{}{s.addr(), w, h, enc, len(msg)}
-	if enc == encZlib && len(payload) >= 8 {
-		loghead += " zlen=%d head=%x"
-		logargs = append(logargs, int(binary.BigEndian.Uint32(payload[0:4])), payload[4:8])
-	}
-	log.Printf(loghead, logargs...)
-	s.writeMu.Lock()
-	_, err := s.conn.Write(msg)
-	s.writeMu.Unlock()
-	if err != nil {
-		log.Printf("[%s]    write error: %v", s.addr(), err)
-	}
-	return err
+	// Encode the rectangle with the client's negotiated encoding (Tight when
+	// supported, else zlib, else Raw). Tight caps each rect at 2048px wide, so a
+	// 2560px-wide full frame is split into <=2048px vertical strips here — each
+	// its own Tight rect — instead of collapsing to a 12 MB Raw frame (which
+	// saturated the link and tripped the 30s read deadline). For a client that
+	// also advertises Zlib/Tight the whole frame stays compressed.
+	parts := s.encodePixelRects(img, x, y, w, h)
+	return s.writeUpdate(parts)
 }
 
 // pixelFormat snapshots the client-negotiated pixel format from the session
