@@ -3,6 +3,7 @@ package rfbcore
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -529,7 +530,7 @@ func TestEncodeDirtyRectRawAndZlib(t *testing.T) {
 	pf := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
 	r := Rect{X: 0, Y: 0, W: 4, H: 4}
 
-	enc, payload := EncodeDirtyRect(img, r, img.Stride, pf, false)
+	enc, payload := EncodeDirtyRect(img, r, img.Stride, pf, false, nil)
 	if enc != EncRaw {
 		t.Fatalf("useZlib=false: enc=%d, want EncRaw(%d)", enc, EncRaw)
 	}
@@ -537,16 +538,25 @@ func TestEncodeDirtyRectRawAndZlib(t *testing.T) {
 		t.Fatalf("raw payload len=%d, want 64", len(payload))
 	}
 
-	enc2, payload2 := EncodeDirtyRect(img, r, img.Stride, pf, true)
+	enc2, payload2 := EncodeDirtyRect(img, r, img.Stride, pf, true, nil)
 	if enc2 != EncZlib {
 		t.Fatalf("useZlib=true: enc=%d, want EncZlib(%d)", enc2, EncZlib)
 	}
-	// CORR-1 contract: an encZlib payload must decompress to the raw pixels.
-	zr, _ := zlib.NewReader(bytes.NewReader(payload2))
+	// CORR-6 / RFC 6143 §7.7.5: encZlib payload = 4-byte BE length prefix + a
+	// self-contained zlib stream of exactly that many bytes.
+	if len(payload2) < 4 {
+		t.Fatalf("encZlib payload too short: %d bytes", len(payload2))
+	}
+	streamLen := int(binary.BigEndian.Uint32(payload2[0:4]))
+	if got := len(payload2) - 4; got != streamLen {
+		t.Fatalf("encZlib length prefix=%d but trailing stream is %d bytes", streamLen, got)
+	}
+	// CORR-1 contract: the zlib stream must decompress to the raw pixels.
+	zr, _ := zlib.NewReader(bytes.NewReader(payload2[4:]))
 	defer zr.Close()
 	round, _ := io.ReadAll(zr)
 	if !bytes.Equal(round, payload) {
-		t.Fatal("CORR-1: encZlib payload must decompress to the raw pixels")
+		t.Fatal("CORR-1: encZlib stream must decompress to the raw pixels")
 	}
 }
 
@@ -588,5 +598,155 @@ func TestEncodePixelsGeneric8bpp(t *testing.T) {
 	// is scaled by 255/255 = identity, then OR'd: 0xff|0x80|0x40 = 0xff.
 	if out[0] != 0xff {
 		t.Fatalf("8bpp out=0x%02x, want 0xff", out[0])
+	}
+}
+
+// TestEncodeDirtyRectPersistentStream is the regression test for the
+// "vnc connection timeout" bug (ZLIB-FIX / RFC 6143 §7.7.5). The old
+// EncodeDirtyRect/ZlibCompress finalized a standalone zlib stream per rect; a
+// strict client's single persistent decompressor reached end-of-stream after
+// rect 1 and choked on rect 2's fresh header, going silent until the server's
+// read deadline fired. This test proves that consecutive rects compressed via
+// one ZlibStream decode correctly through a SINGLE decompressor that is never
+// reset between rects.
+func TestEncodeDirtyRectPersistentStream(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 8, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 8; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 30), G: uint8(y * 60), B: 128, A: 255})
+		}
+	}
+	pf := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	stream := NewZlibStream(6)
+	defer stream.Close()
+
+	// Two consecutive rects through the shared stream.
+	r1 := Rect{X: 0, Y: 0, W: 4, H: 4}
+	r2 := Rect{X: 4, Y: 0, W: 4, H: 4}
+	want1 := EncodeRectPixels(img, r1.X, r1.Y, r1.W, r1.H, img.Stride, pf)
+	want2 := EncodeRectPixels(img, r2.X, r2.Y, r2.W, r2.H, img.Stride, pf)
+
+	enc1, p1 := EncodeDirtyRect(img, r1, img.Stride, pf, true, stream)
+	enc2, p2 := EncodeDirtyRect(img, r2, img.Stride, pf, true, stream)
+	if enc1 != EncZlib || enc2 != EncZlib {
+		t.Fatalf("encodings: %d, %d; want EncZlib(%d)", enc1, enc2, EncZlib)
+	}
+
+	// A single decompressor fed rect1's fragment then rect2's fragment must
+	// reproduce the two pixel payloads in order. This is the RFB client model:
+	// one decompressor, fragments concatenated. With the old per-rect Close()
+	// the first fragment ended its stream, so feeding the second fragment raised
+	// "unexpected EOF" / the decompressor stopped — the silent client.
+	// A VNC client feeds each rect's fragment to ONE decompressor and reads back
+	// exactly that rect's pixels (it knows the uncompressed size from the rect
+	// header); it does NOT ReadAll-to-EOF, because a Z_SYNC_FLUSH'd stream is
+	// intentionally non-terminating. Mirror that model: one reader, read the
+	// known pixel counts per rect.
+	combined := make([]byte, 0, len(p1)+len(p2)-8)
+	combined = append(combined, p1[4:]...)
+	combined = append(combined, p2[4:]...)
+	zr, err := zlib.NewReader(bytes.NewReader(combined))
+	if err != nil {
+		t.Fatalf("zlib.NewReader on concatenated rect fragments: %v (this is the bug — first stream ended)", err)
+	}
+	defer zr.Close()
+
+	// Rect 1: read exactly len(want1) pixels.
+	got1 := make([]byte, len(want1))
+	if _, err := io.ReadFull(zr, got1); err != nil {
+		t.Fatalf("decode rect1 (%d bytes): %v (ZLIB-FIX regression: stream ended after rect 1)", len(want1), err)
+	}
+	if !bytes.Equal(got1, want1) {
+		t.Fatalf("rect1 decompressed mismatch")
+	}
+	// Rect 2: same decompressor, continues the shared dictionary.
+	got2 := make([]byte, len(want2))
+	if _, err := io.ReadFull(zr, got2); err != nil {
+		t.Fatalf("decode rect2 (%d bytes): %v (the client would go silent here with the old per-rect Close())", len(want2), err)
+	}
+	if !bytes.Equal(got2, want2) {
+		t.Fatalf("rect2 decompressed mismatch")
+	}
+}
+// TestRFBZlibStreamLibVNCClientModel is the end-to-end proof that the persistent
+// ZlibStream produces wire output Remmina (libvncclient) can decode.
+//
+// libvncclient's real behaviour for the RFB Zlib encoding:
+//   - one persistent inflate stream for the whole connection (it is created on
+//     the first Zlib rect and reused for every subsequent one — never reset),
+//   - for each rect it reads the 4-byte BE length, then feeds EXACTLY that many
+//     compressed bytes into the persistent inflater,
+//   - it then reads exactly width*height*bytesPerPixel pixels out of the
+//     inflater (it knows the uncompressed size from the rect header).
+//
+// This test replays that exact loop over many consecutive rects of varying
+// sizes (including a 2560x1172-class full frame) and asserts every pixel block
+// decodes correctly. The old per-rect Close() fails here on rect 2 with EOF.
+func TestRFBZlibStreamLibVNCClientModel(t *testing.T) {
+	pf := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	stream := NewZlibStream(6)
+	defer stream.Close()
+
+	// Build a full desktop frame and a set of dirty rects a client would see:
+	// a full frame (first non-incremental request) plus several dirty tiles.
+	const W, H = 2560, 1172
+	img := image.NewRGBA(image.Rect(0, 0, W, H))
+	for y := 0; y < H; y++ {
+		for x := 0; x < W; x++ {
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8((x * 255) / W),
+				G: uint8((y * 255) / H),
+				B: uint8((x ^ y) & 0xff),
+				A: 255,
+			})
+		}
+	}
+
+	rects := []Rect{
+		{X: 0, Y: 0, W: W, H: H},         // full frame
+		{X: 0, Y: 0, W: 32, H: 32},       // tile
+		{X: 100, Y: 200, W: 64, H: 32},   // small rect
+		{X: 500, Y: 500, W: 320, H: 240}, // medium rect
+		{X: 0, Y: 0, W: W, H: H},         // full frame again (dictionary reuse)
+	}
+
+	// libvncclient: ONE persistent inflater for the whole connection. Collect all
+	// compressed fragments in order, then read them back through a single
+	// zlib.Reader — feeding exactly length-prefixed bytes per rect and reading
+	// back exactly width*height*4 pixels, exactly as the client does.
+	var all bytes.Buffer
+	var wantLens []int
+	for i, r := range rects {
+		enc, payload := EncodeDirtyRect(img, r, img.Stride, pf, true, stream)
+		if enc != EncZlib {
+			t.Fatalf("rect %d: enc=%d want EncZlib", i, enc)
+		}
+		wantLen := int(binary.BigEndian.Uint32(payload[0:4]))
+		if got := len(payload) - 4; got != wantLen {
+			t.Fatalf("rect %d: length prefix %d != actual %d", i, wantLen, got)
+		}
+		all.Write(payload[4 : 4+wantLen])
+		wantLens = append(wantLens, wantLen)
+	}
+
+	zr, err := zlib.NewReader(bytes.NewReader(all.Bytes()))
+	if err != nil {
+		t.Fatalf("zlib.NewReader on concatenated fragments: %v", err)
+	}
+	defer zr.Close()
+
+	for i, r := range rects {
+		// Read exactly the uncompressed pixel count back (client knows the size
+		// from the rect header). This must succeed for every rect.
+		wantPx := EncodeRectPixels(img, r.X, r.Y, r.W, r.H, img.Stride, pf)
+		gotPx := make([]byte, len(wantPx))
+		if _, err := io.ReadFull(zr, gotPx); err != nil {
+			t.Fatalf("rect %d: decode %d bytes (libvncclient would drop the connection here): %v",
+				i, len(wantPx), err)
+		}
+		if !bytes.Equal(gotPx, wantPx) {
+			t.Fatalf("rect %d: pixel mismatch", i)
+		}
+		_ = wantLens[i] // lengths already validated above; retained for clarity
 	}
 }

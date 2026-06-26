@@ -93,6 +93,15 @@ type session struct {
 	// (1-9, default 6) and JPEG quality (0 = no JPEG; else 10-100).
 	tightLevel  int
 	jpegQuality int
+
+	// zlibStream is the single persistent deflate context for the EncZlib
+	// encoding (RFC 6143 §7.7.5): the connection must reuse ONE zlib stream so
+	// the client's decompressor stays primed and dictionaries carry across
+	// rectangles. Created lazily on the first zlib-encoded rect and closed when
+	// the session ends. ZLIB-FIX: the old per-rect zlib.NewWriter+Close
+	// finalized a standalone stream each time, so strict clients hit
+	// end-of-stream after rect 1 and went silent (vnc connection timeout).
+	zlibStream *rfbcore.ZlibStream
 }
 
 func (s *session) addr() string { return s.conn.RemoteAddr().String() }
@@ -124,6 +133,7 @@ func (s *session) initClientPixelFormat() {
 // Serve runs the RFB handshake then the main message loop.
 func (s *session) Serve() {
 	defer s.conn.Close()
+	defer s.closeZlibStream()
 
 	s.initClientPixelFormat()
 	s.tightLevel = 6 // default Tight zlib level until the client hints otherwise
@@ -546,18 +556,38 @@ func (s *session) sendEmptyUpdate() error {
 	return err
 }
 
+// encodePixelRect selects the best wire encoding for one pixel rectangle given
+// the client's advertised encodings and Tight tuning. It is shared by
+// sendFramebufferUpdate (the single full-frame rect used for non-incremental
+// requests and the CaptureDirty full-degradation path) and sendDirtyUpdate
+// (each dirty rect) so both paths honor the negotiated encodings identically.
+//
+// Tight (Fill/Basic-zlib/JPEG) is preferred when the client supports it and the
+// rect fits Tight's 2048px width limit; otherwise zlib (RFC 6143
+// length-prefixed) when supported; otherwise Raw. EncodeDirtyRect downgrades to
+// Raw on zlib failure (CORR-1), so a failure never corrupts the stream.
+func (s *session) encodePixelRect(img *image.RGBA, x, y, w, h int) (enc int32, payload []byte) {
+	rect := rfbcore.Rect{X: x, Y: y, W: w, H: h}
+	stride := img.Stride
+	pf := s.pixelFormat()
+	if s.clientSupports(encTight) && w <= 2048 {
+		useJPEG := s.jpegQuality > 0 && (pf.Bpp == 32 || pf.Bpp == 16)
+		if tp, err := rfbcore.EncodeTight(img, rect, stride, pf, s.tightLevel, useJPEG, s.jpegQuality); err == nil {
+			return encTight, tp
+		}
+	}
+	return rfbcore.EncodeDirtyRect(img, rect, stride, pf, s.clientSupports(encZlib), s.getZlibStream())
+}
+
 // sendDirtyUpdate sends a FramebufferUpdate containing CopyRect moves (when the
 // client supports it) plus dirty pixel rectangles. Each rect is encoded
 // separately; dirty pixel rects use zlib when the client supports it, otherwise
 // Raw (EncodeDirtyRect downgrades on zlib failure — CORR-1). A move whose client
 // lacks CopyRect support is sent as destination pixels instead.
 func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dirty []rfbcore.Rect) error {
-	stride := img.Stride
 	useZlib := s.clientSupports(encZlib)
 	useCopyRect := s.clientSupports(encCopyRect)
-	pf := s.pixelFormat()
 	useTight := s.clientSupports(encTight)
-	useJPEG := useTight && s.jpegQuality > 0 && (pf.Bpp == 32 || pf.Bpp == 16)
 
 	// Build each rect (12-byte header + payload) up front so the message length
 	// is known before the single allocating write.
@@ -581,21 +611,7 @@ func (s *session) sendDirtyUpdate(img *image.RGBA, moves []rfbcore.CopyRect, dir
 		parts = append(parts, p)
 	}
 	addPixels := func(x, y, w, h int) {
-		rect := rfbcore.Rect{X: x, Y: y, W: w, H: h}
-		var enc int32
-		var payload []byte
-		// Prefer Tight (Fill/Basic-zlib/JPEG) when the client supports it and the
-		// rect is within Tight's 2048px width limit; fall back to Raw/Zlib on any
-		// failure or for over-wide rects.
-		if useTight && w <= 2048 {
-			if tp, err := rfbcore.EncodeTight(img, rect, stride, pf, s.tightLevel, useJPEG, s.jpegQuality); err == nil {
-				enc = encTight
-				payload = tp
-			}
-		}
-		if payload == nil {
-			enc, payload = rfbcore.EncodeDirtyRect(img, rect, stride, pf, useZlib)
-		}
+		enc, payload := s.encodePixelRect(img, x, y, w, h)
 		var p rectPart
 		binary.BigEndian.PutUint16(p.hdr[0:2], uint16(x))
 		binary.BigEndian.PutUint16(p.hdr[2:4], uint16(y))
@@ -656,39 +672,38 @@ func (s *session) sendFramebufferUpdate(img *image.RGBA, x, y, w, h int) error {
 		return nil
 	}
 
-	pf := s.pixelFormat()
-	bytesPerPixel := pf.BytesPerPixel()
-	pixelBytes := w * h * bytesPerPixel
-	buf := make([]byte, 4+12+pixelBytes)
+	// Encode the single rect with the client's negotiated encoding (Tight when
+	// supported, else zlib, else Raw) — same selection as sendDirtyUpdate, via
+	// the shared encodePixelRect helper. The previous implementation hardcoded
+	// encRaw, so a 2560x1172 32-bpp frame left the wire as ~12 MB uncompressed
+	// on every non-incremental request and every CaptureDirty full-degradation,
+	// saturating the link and tripping the 30 s read deadline (i/o timeout).
+	enc, payload := s.encodePixelRect(img, x, y, w, h)
 
+	msg := make([]byte, 4+12+len(payload))
 	// FramebufferUpdate header: type(1) + padding(1) + numRects(2)
-	buf[0] = serverFramebufferUpdate
-	buf[1] = 0
-	binary.BigEndian.PutUint16(buf[2:4], 1)
+	msg[0] = serverFramebufferUpdate
+	msg[1] = 0
+	binary.BigEndian.PutUint16(msg[2:4], 1)
 
 	// Rectangle header: x(2)+y(2)+w(2)+h(2)+encoding(4)
-	binary.BigEndian.PutUint16(buf[4:6], uint16(x))
-	binary.BigEndian.PutUint16(buf[6:8], uint16(y))
-	binary.BigEndian.PutUint16(buf[8:10], uint16(w))
-	binary.BigEndian.PutUint16(buf[10:12], uint16(h))
-	binary.BigEndian.PutUint32(buf[12:16], uint32(encRaw))
+	binary.BigEndian.PutUint16(msg[4:6], uint16(x))
+	binary.BigEndian.PutUint16(msg[6:8], uint16(y))
+	binary.BigEndian.PutUint16(msg[8:10], uint16(w))
+	binary.BigEndian.PutUint16(msg[10:12], uint16(h))
+	binary.BigEndian.PutUint32(msg[12:16], uint32(enc))
+	copy(msg[16:], payload)
 
-	// Encode pixels.  The common case — a 32-bpp client using the canonical
-	// RGB-255 / R,G,B-shift 16,8,0 format — is handled by the fast path
-	// (bulk per-row copy with an optional byte-swap).  Anything else falls
-	// back to the generic per-pixel loop for correctness.
-	off := 16
-	stride := img.Stride
-
-	if rfbcore.CanUseFastPath(pf) {
-		rfbcore.EncodePixelsFast(img, x, y, w, h, stride, pf.BigEndian != 0, buf[off:])
-	} else {
-		rfbcore.EncodePixelsGeneric(img, x, y, w, h, stride, bytesPerPixel, pf, buf[off:])
+	// ZLIB-FIX 诊断：enc=6(Zlib) 时打印长度前缀+首字节，便于核对持久流
+	loghead := "[%s] >> FBU %dx%d enc=%d (%d bytes)"
+	logargs := []interface{}{s.addr(), w, h, enc, len(msg)}
+	if enc == encZlib && len(payload) >= 8 {
+		loghead += " zlen=%d head=%x"
+		logargs = append(logargs, int(binary.BigEndian.Uint32(payload[0:4])), payload[4:8])
 	}
-
-	log.Printf("[%s] >> FBU raw %dx%d (%d bytes)", s.addr(), w, h, len(buf))
+	log.Printf(loghead, logargs...)
 	s.writeMu.Lock()
-	_, err := s.conn.Write(buf)
+	_, err := s.conn.Write(msg)
 	s.writeMu.Unlock()
 	if err != nil {
 		log.Printf("[%s]    write error: %v", s.addr(), err)
@@ -723,6 +738,26 @@ func (s *session) clientSupports(enc int32) bool {
 		}
 	}
 	return false
+}
+
+// zlibStream returns the connection's persistent EncZlib deflate context,
+// creating it lazily on first use. Only the message loop (which runs
+// handleFBUpdateRequest -> send*Update -> encodePixelRect) calls this, so it is
+// single-goroutine by construction; closeZlibStream runs at session teardown
+// after the loop has exited. ZLIB-FIX (RFC 6143 §7.7.5).
+func (s *session) getZlibStream() *rfbcore.ZlibStream {
+	if s.zlibStream == nil {
+		s.zlibStream = rfbcore.NewZlibStream(6)
+	}
+	return s.zlibStream
+}
+
+// closeZlibStream releases the persistent deflate context at session end. It is
+// a no-op when the client never used EncZlib (no stream was ever created).
+func (s *session) closeZlibStream() {
+	if s.zlibStream != nil {
+		s.zlibStream.Close()
+	}
 }
 
 func (s *session) handleKeyEvent() error {

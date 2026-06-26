@@ -47,6 +47,21 @@ var buildWithAuthPass string
 // Only used when no Tailscale auth key is provided. Defaults to 0.0.0.0.
 var buildWithListenAddr string
 
+// version / buildTime are injected via LDFLAGS -X main.version / -X main.buildTime
+// (see Makefile). Printed at startup so the log line unambiguously identifies
+// which build is running — needed to stop debugging against a stale .exe.
+var (
+	version   = "dev"
+	buildTime = "unknown"
+)
+
+// logBanner prints the build identity at startup. zlibFix tracks whether this
+// build includes the persistent deflate-stream fix (RFC 6143 §7.7.5); the
+// version string itself carries the build suffix so there is no ambiguity.
+func logBanner() {
+	log.Printf("=== TailVNC %s (built %s) — zlib-fix: persistent RFB deflate stream ===", version, buildTime)
+}
+
 // flagValue returns the value following a "--name" flag in os.Args, or the
 // empty string when the flag is absent.  Lightweight command-line parsing
 // without depending on the flag package.
@@ -147,6 +162,8 @@ func serve(listener net.Listener, authPass string) error {
 }
 
 func main() {
+	logBanner()
+
 	// Agent mode: spawned by the service inside the user's session.
 	// Must be checked before anything else (before auth-key guard, before tsnet).
 	if port := agentPort(); port != "" {
