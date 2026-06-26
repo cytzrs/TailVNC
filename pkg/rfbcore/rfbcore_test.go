@@ -198,6 +198,54 @@ func TestDetectMovesNilFrames(t *testing.T) {
 	}
 }
 
+func TestEncodeCursorPseudoRectLayout(t *testing.T) {
+	// 2x2 cursor: (0,0)=opaque red, (1,0)=transparent, others opaque.
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	img.Set(1, 0, color.RGBA{A: 0})
+	img.Set(0, 1, color.RGBA{G: 255, A: 255})
+	img.Set(1, 1, color.RGBA{B: 255, A: 255})
+	pf := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	buf := EncodeCursorPseudoRect(5, 6, 2, 2, 1, 0, pf, img)
+
+	// 12-byte header + 2*2*4 pixel bytes + ceil(2/8)*2 mask bytes = 12+16+2 = 30.
+	if len(buf) != 30 {
+		t.Fatalf("len=%d, want 30", len(buf))
+	}
+	// rect x=5, y=6 (big-endian uint16 -> low byte in buf[1], buf[3]).
+	if buf[1] != 5 || buf[3] != 6 {
+		t.Fatalf("pos: x=%d y=%d, want 5/6", buf[1], buf[3])
+	}
+	// encoding field = -239 = 0xFFFFFF11 -> [0xff,0xff,0xff,0x11].
+	if buf[8] != 0xff || buf[11] != 0x11 {
+		t.Fatalf("encoding bytes=%x, want ffffff11 (-239)", buf[8:12])
+	}
+	// Row-0 mask byte (MSB-first): col0 opaque(1), col1 transparent(0) -> 0x80.
+	maskOff := 12 + 2*2*4
+	if buf[maskOff] != 0x80 {
+		t.Fatalf("row0 mask=0x%02x, want 0x80 (col0 opaque, col1 transparent)", buf[maskOff])
+	}
+}
+
+func TestEncodeCursorPseudoRectMaskPadding(t *testing.T) {
+	// A 9px-wide cursor needs ceil(9/8)=2 mask bytes per row. All opaque.
+	img := image.NewRGBA(image.Rect(0, 0, 9, 1))
+	for x := 0; x < 9; x++ {
+		img.Set(x, 0, color.RGBA{R: 1, A: 255})
+	}
+	pf := PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}
+	buf := EncodeCursorPseudoRect(0, 0, 9, 1, 0, 0, pf, img)
+	// 12 + 9*4 pixels + 2 mask bytes.
+	if len(buf) != 12+36+2 {
+		t.Fatalf("len=%d, want %d", len(buf), 12+36+2)
+	}
+	// Row mask: 9 bits set, MSB-first -> 0xFF (bits 0-7), 0x80 (bit 8).
+	maskOff := 12 + 36
+	if buf[maskOff] != 0xff || buf[maskOff+1] != 0x80 {
+		t.Fatalf("mask=%x, want ff80", buf[maskOff:maskOff+2])
+	}
+}
+
 func TestPixelFormatBytesPerPixel(t *testing.T) {
 	cases := []struct {
 		bpp  uint8
