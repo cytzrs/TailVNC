@@ -123,11 +123,20 @@ func switchToInputDesktop() (bool, string) {
 	return ret != 0, name
 }
 
-// Capturer captures the desktop screen using CreateDIBSection for direct pixel access.
+// Capturer captures the desktop screen using CreateDIBSection for direct pixel
+// access. The compatible DC and DIB section are pooled (created on first
+// capture, freed by Close) so each frame only does GetDC/ReleaseDC + BitBlt
+// instead of a full DC+bitmap create/destroy cycle — a significant GDI/syscall
+// churn cut at 30 fps. The capture goroutine is runtime.LockOSThread'd, so these
+// thread-affine handles stay on one OS thread for their lifetime.
 type Capturer struct {
 	mu     sync.Mutex
 	width  int
 	height int
+
+	memDC uintptr        // pooled compatible DC
+	bmp   uintptr        // pooled DIB section
+	bits  unsafe.Pointer // pooled DIB pixel pointer (BGRA)
 }
 
 func screenSize() (int, int) {
@@ -147,8 +156,66 @@ func NewCapturer() (*Capturer, error) {
 func (c *Capturer) Width() int  { return c.width }
 func (c *Capturer) Height() int { return c.height }
 
-// Capture grabs the current desktop into an RGBA image.
-// Uses CreateDIBSection so pixels are directly accessible via a pointer.
+// ensureBuffer lazily creates the pooled DC + DIB. Dims are fixed for a
+// Capturer's lifetime (a desktop change creates a fresh Capturer), so this runs
+// at most once per Capturer.
+func (c *Capturer) ensureBuffer(screenDC uintptr) error {
+	if c.memDC != 0 && c.bmp != 0 && c.bits != nil {
+		return nil
+	}
+	memDC, _, _ := procCreateCompatDC.Call(screenDC)
+	if memDC == 0 {
+		return fmt.Errorf("CreateCompatibleDC failed")
+	}
+	bi := bitmapInfo{
+		Header: bitmapInfoHeader{
+			Size:     uint32(unsafe.Sizeof(bitmapInfoHeader{})),
+			Width:    int32(c.width),
+			Height:   -int32(c.height), // negative = top-down DIB
+			Planes:   1,
+			BitCount: 32,
+		},
+	}
+	var bits unsafe.Pointer
+	bmp, _, _ := procCreateDIBSection.Call(
+		memDC,
+		uintptr(unsafe.Pointer(&bi)),
+		dibRgbColors,
+		uintptr(unsafe.Pointer(&bits)),
+		0, 0,
+	)
+	if bmp == 0 || bits == nil {
+		procDeleteDC.Call(memDC)
+		return fmt.Errorf("CreateDIBSection failed (bmp=%v bits=%v)", bmp, bits)
+	}
+	procSelectObject.Call(memDC, bmp)
+	c.memDC, c.bmp, c.bits = memDC, bmp, bits
+	return nil
+}
+
+func (c *Capturer) destroyBuffer() {
+	if c.bmp != 0 {
+		procDeleteObject.Call(c.bmp)
+		c.bmp = 0
+	}
+	if c.memDC != 0 {
+		procDeleteDC.Call(c.memDC)
+		c.memDC = 0
+	}
+	c.bits = nil
+}
+
+// Close releases the pooled GDI objects. Idempotent; call before discarding a
+// Capturer (e.g. on desktop change) so the thread-affine handles don't leak.
+func (c *Capturer) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.destroyBuffer()
+}
+
+// Capture grabs the current desktop into a freshly allocated RGBA image (a new
+// buffer per call, so callers can hold it across capture cycles without races).
+// The GDI DC/DIB backing the capture are pooled; only the RGBA copy is allocated.
 func (c *Capturer) Capture() (*image.RGBA, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -163,53 +230,22 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 	}
 	defer procReleaseDC.Call(0, screenDC)
 
-	memDC, _, _ := procCreateCompatDC.Call(screenDC)
-	if memDC == 0 {
-		return nil, fmt.Errorf("CreateCompatibleDC failed")
-	}
-	defer procDeleteDC.Call(memDC)
-
-	bi := bitmapInfo{
-		Header: bitmapInfoHeader{
-			Size:     uint32(unsafe.Sizeof(bitmapInfoHeader{})),
-			Width:    int32(c.width),
-			Height:   -int32(c.height), // negative = top-down DIB
-			Planes:   1,
-			BitCount: 32,
-		},
+	if err := c.ensureBuffer(screenDC); err != nil {
+		return nil, err
 	}
 
-	var bits unsafe.Pointer
-	bmp, _, _ := procCreateDIBSection.Call(
-		screenDC,
-		uintptr(unsafe.Pointer(&bi)),
-		dibRgbColors,
-		uintptr(unsafe.Pointer(&bits)),
-		0, 0,
-	)
-	if bmp == 0 || bits == nil {
-		return nil, fmt.Errorf("CreateDIBSection failed (bmp=%v bits=%v)", bmp, bits)
-	}
-	defer procDeleteObject.Call(bmp)
-
-	procSelectObject.Call(memDC, bmp)
-
-	ret, _, _ := procBitBlt.Call(memDC, 0, 0, uintptr(c.width), uintptr(c.height),
-		screenDC, 0, 0, srccopy)
-	if ret == 0 {
+	if ret, _, _ := procBitBlt.Call(c.memDC, 0, 0, uintptr(c.width), uintptr(c.height),
+		screenDC, 0, 0, srccopy); ret == 0 {
 		return nil, fmt.Errorf("BitBlt failed")
 	}
 
-	// bits points to the raw BGRA pixel data.
-	n := c.width * c.height * 4
-	raw := unsafe.Slice((*byte)(bits), n)
-
-	// Convert BGRA -> RGBA
+	// bits points to the raw BGRA pixel data of the pooled DIB.
+	raw := unsafe.Slice((*byte)(c.bits), c.width*c.height*4)
 	img := image.NewRGBA(image.Rect(0, 0, c.width, c.height))
 	for i := 0; i < c.width*c.height; i++ {
-		img.Pix[i*4+0] = raw[i*4+2] // R
+		img.Pix[i*4+0] = raw[i*4+2] // R <- B
 		img.Pix[i*4+1] = raw[i*4+1] // G
-		img.Pix[i*4+2] = raw[i*4+0] // B
+		img.Pix[i*4+2] = raw[i*4+0] // B <- R
 		img.Pix[i*4+3] = 0xff
 	}
 	return img, nil
@@ -331,7 +367,10 @@ func (c *SessionAwareCapturer) loop() {
 			log.Printf("[screen] desktop changed: %q → %q", lastDesk, desk)
 			lastDesk = desk
 			// Reset capturer because the new desktop may have different dimensions.
-			capturer = nil
+			if capturer != nil {
+				capturer.Close()
+				capturer = nil
+			}
 		}
 
 		if capturer == nil {
@@ -351,6 +390,7 @@ func (c *SessionAwareCapturer) loop() {
 		img, err := capturer.Capture()
 		if err != nil {
 			log.Printf("[screen] Capture on desktop %q: %v", desk, err)
+			capturer.Close()
 			capturer = nil
 			time.Sleep(100 * time.Millisecond)
 			continue
