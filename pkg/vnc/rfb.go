@@ -37,6 +37,7 @@ const (
 	encCopyRect = 1
 	encZlib     = 6
 	encTight    = 7
+	encCursor   = -239 // Cursor pseudo-encoding: server sends shape, client renders locally
 )
 
 // The canonical RFB pixel format: 32 bpp, big-endian, XRGB
@@ -69,6 +70,11 @@ type session struct {
 
 	// writeMu protects all writes to conn (message loop + clipboard goroutine).
 	writeMu sync.Mutex
+
+	// encMu guards clientEncodings (written by the message loop, read by the
+	// cursor push goroutine). cursorStop closes to signal the cursor loop exit.
+	encMu      sync.Mutex
+	cursorStop chan struct{}
 
 	// client's current pixel format (updated by SetPixelFormat messages)
 	clientBpp       uint8
@@ -129,6 +135,12 @@ func (s *session) Serve() {
 		go s.clipboardSendLoop(clipCh)
 	}
 
+	// Start the local-cursor push loop (only sends once the client advertises
+	// the Cursor pseudo-encoding -239).
+	s.cursorStop = make(chan struct{})
+	defer close(s.cursorStop)
+	go s.cursorSendLoop()
+
 	if err := s.messageLoop(); err != nil && err != io.EOF {
 		log.Printf("[%s] disconnected: %v", s.addr(), err)
 	} else {
@@ -141,6 +153,38 @@ func (s *session) Serve() {
 func (s *session) clipboardSendLoop(ch chan string) {
 	for text := range ch {
 		if err := s.sendServerCutText(text); err != nil {
+			return
+		}
+	}
+}
+
+// cursorSendLoop pushes the cursor shape to the client when it changes AND the
+// client advertised the Cursor pseudo-encoding (-239). The client then renders
+// the cursor locally, so mouse motion costs no bandwidth. Exits when cursorStop
+// closes (session end) or the connection breaks.
+func (s *session) cursorSendLoop() {
+	var prevHandle uintptr
+	for {
+		select {
+		case <-s.cursorStop:
+			return
+		case <-time.After(100 * time.Millisecond): // ~10Hz shape-change poll
+		}
+		if !s.clientSupports(encCursor) {
+			continue
+		}
+		shot := captureCursor(prevHandle)
+		prevHandle = shot.handle
+		if !shot.changed || shot.img == nil {
+			continue
+		}
+		buf := rfbcore.EncodeCursorPseudoRect(shot.x, shot.y,
+			shot.img.Bounds().Dx(), shot.img.Bounds().Dy(),
+			shot.hotX, shot.hotY, s.pixelFormat(), shot.img)
+		s.writeMu.Lock()
+		_, err := s.conn.Write(buf)
+		s.writeMu.Unlock()
+		if err != nil {
 			return
 		}
 	}
@@ -420,7 +464,9 @@ func (s *session) handleSetEncodings() error {
 	for i := uint16(0); i < numEnc; i++ {
 		encs[i] = int32(binary.BigEndian.Uint32(buf[i*4 : i*4+4]))
 	}
+	s.encMu.Lock()
 	s.clientEncodings = encs
+	s.encMu.Unlock()
 	log.Printf("[%s]   SetEncodings: %d encodings %v", s.addr(), numEnc, encs)
 	return nil
 }
@@ -630,7 +676,11 @@ func (s *session) pixelFormat() rfbcore.PixelFormat {
 }
 
 // clientSupports reports whether the client advertised the given encoding.
+// Guarded by encMu so the cursor push goroutine can call it concurrently with
+// SetEncodings.
 func (s *session) clientSupports(enc int32) bool {
+	s.encMu.Lock()
+	defer s.encMu.Unlock()
 	for _, e := range s.clientEncodings {
 		if e == enc {
 			return true
