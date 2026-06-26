@@ -246,6 +246,71 @@ func TestEncodeCursorPseudoRectMaskPadding(t *testing.T) {
 	}
 }
 
+func TestCanUseFastPath565(t *testing.T) {
+	if !CanUseFastPath565(PixelFormat565) {
+		t.Fatal("PixelFormat565 should match the 565 fast path")
+	}
+	// 32bpp canonical must NOT match 565.
+	if CanUseFastPath565(PixelFormat{Bpp: 32, RMax: 255, GMax: 255, BMax: 255, RShift: 16, GShift: 8, BShift: 0}) {
+		t.Fatal("32bpp must not match 565 fast path")
+	}
+}
+
+func TestEncodePixelsFast565(t *testing.T) {
+	// 3x1: red, green, blue. 565: red=0xF800, green=0x07E0, blue=0x001F.
+	img := image.NewRGBA(image.Rect(0, 0, 3, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	img.Set(1, 0, color.RGBA{G: 255, A: 255})
+	img.Set(2, 0, color.RGBA{B: 255, A: 255})
+	out := make([]byte, 3*2)
+
+	EncodePixelsFast565(img, 0, 0, 3, 1, img.Stride, true, out) // big-endian
+	want := []byte{0xF8, 0x00, 0x07, 0xE0, 0x00, 0x1F}
+	if !bytes.Equal(out, want) {
+		t.Fatalf("BE out=% x, want % x", out, want)
+	}
+
+	EncodePixelsFast565(img, 0, 0, 3, 1, img.Stride, false, out) // little-endian
+	wantLE := []byte{0x00, 0xF8, 0xE0, 0x07, 0x1F, 0x00}
+	if !bytes.Equal(out, wantLE) {
+		t.Fatalf("LE out=% x, want % x", out, wantLE)
+	}
+}
+
+func TestEncodePixelsFast565MatchesGeneric(t *testing.T) {
+	// The fast path must be byte-identical to the proven generic path, both
+	// endiannesses, over a small gradient.
+	img := image.NewRGBA(image.Rect(0, 0, 4, 3))
+	for y := 0; y < 3; y++ {
+		for x := 0; x < 4; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 60), G: uint8(y * 80), B: uint8(x*30 + y*40), A: 255})
+		}
+	}
+	for _, be := range []bool{true, false} {
+		fast := make([]byte, 4*3*2)
+		EncodePixelsFast565(img, 0, 0, 4, 3, img.Stride, be, fast)
+		pf := PixelFormat565
+		if !be {
+			pf.BigEndian = 0
+		}
+		gen := make([]byte, 4*3*2)
+		EncodePixelsGeneric(img, 0, 0, 4, 3, img.Stride, 2, pf, gen)
+		if !bytes.Equal(fast, gen) {
+			t.Fatalf("be=%v: fast=% x != gen=% x", be, fast, gen)
+		}
+	}
+}
+
+func TestEncodeRectPixelsUses565FastPath(t *testing.T) {
+	// EncodeRectPixels must dispatch a 565 format to the fast path (2 bytes/pixel).
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	out := EncodeRectPixels(img, 0, 0, 1, 1, img.Stride, PixelFormat565) // PixelFormat565 is big-endian
+	if len(out) != 2 || out[0] != 0xF8 || out[1] != 0x00 {
+		t.Fatalf("565 out=% x, want [f8 00]", out)
+	}
+}
+
 func TestPixelFormatBytesPerPixel(t *testing.T) {
 	cases := []struct {
 		bpp  uint8
