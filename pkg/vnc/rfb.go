@@ -5,6 +5,7 @@ package vnc
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"image"
@@ -67,6 +68,9 @@ type session struct {
 	serverW   int
 	serverH   int
 	password  string
+
+	// tlsConfig, when non-nil, enables VeNCrypt TLS encryption for this session.
+	tlsConfig *tls.Config
 
 	// writeMu protects all writes to conn (message loop + clipboard goroutine).
 	writeMu sync.Mutex
@@ -237,16 +241,21 @@ func (s *session) handshake() error {
 	log.Printf("[%s] client version: %q", s.addr(), string(clientVer[:]))
 
 	// 3. Server → Client: security type list
-	//    No password → offer None(1) so clients without a password can skip auth.
-	//    With password → offer VNCAuth(2) only, client must authenticate.
+	//    Build the list based on config:
+	//    - If TLSConfig is set, offer VeNCrypt(19) + VNCAuth(2) or None(1)
+	//    - Otherwise, offer VNCAuth(2) or None(1) as before
+	var secTypes []byte
+	if s.tlsConfig != nil {
+		secTypes = append(secTypes, secVeNCrypt)
+	}
 	if s.password == "" {
-		if _, err := s.conn.Write([]byte{1, secNone}); err != nil {
-			return err
-		}
+		secTypes = append(secTypes, secNone)
 	} else {
-		if _, err := s.conn.Write([]byte{1, secVNCAuth}); err != nil {
-			return err
-		}
+		secTypes = append(secTypes, secVNCAuth)
+	}
+	secTypes = append([]byte{byte(len(secTypes))}, secTypes...)
+	if _, err := s.conn.Write(secTypes); err != nil {
+		return err
 	}
 
 	// 4. Client → Server: chosen security type
@@ -258,6 +267,26 @@ func (s *session) handshake() error {
 
 	// 5. Authentication
 	switch secType[0] {
+	case secVeNCrypt:
+		// VeNCrypt: negotiate TLS tunnel, then continue with VNC auth inside it.
+		tlsConn, err := s.doVeNCrypt()
+		if err != nil {
+			return err
+		}
+		// Replace the raw conn with the TLS-wrapped conn for all further I/O.
+		s.conn = tlsConn
+		// After TLS is established, VeNCrypt expects the standard VNC auth
+		// (DES challenge-response) to run inside the tunnel when a password is set.
+		if s.password != "" {
+			if err := s.doVNCAuth(); err != nil {
+				return err
+			}
+		} else {
+			// No password: SecurityResult OK.
+			if err := binary.Write(s.conn, binary.BigEndian, uint32(0)); err != nil {
+				return err
+			}
+		}
 	case secVNCAuth:
 		if err := s.doVNCAuth(); err != nil {
 			return err

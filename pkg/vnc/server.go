@@ -10,6 +10,8 @@ import (
 	"time"
 	"unsafe"
 
+	"crypto/tls"
+
 	"golang.org/x/sys/windows"
 	"tailvnc/pkg/rfbcore"
 )
@@ -19,6 +21,11 @@ type Server struct {
 	// Password is the VNC authentication password.
 	// An empty string disables authentication (accepts any client).
 	Password string
+
+	// TLSConfig, when non-nil, enables VeNCrypt TLS encryption.
+	// Clients that support VeNCrypt will get a TLS-wrapped RFB session.
+	// Clients without VeNCrypt fall back to plain RFB (backward compatible).
+	TLSConfig *tls.Config
 }
 
 // NewServer returns a default Server.
@@ -301,6 +308,7 @@ func (s *Server) serveVNC(ln net.Listener, capturer ScreenCapturer, input InputI
 			serverW:   capturer.Width(),
 			serverH:   capturer.Height(),
 			password:  s.Password,
+			tlsConfig: s.TLSConfig,
 		}
 		go sess.Serve()
 	}

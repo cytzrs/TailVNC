@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/hex"
+	"crypto/tls"
 	"io"
 	"log"
 	"net"
@@ -47,6 +48,13 @@ var buildWithAuthPass string
 // Build-time injected listen address for direct (non-tsnet) mode.
 // Only used when no Tailscale auth key is provided. Defaults to 0.0.0.0.
 var buildWithListenAddr string
+
+// Build-time injected TLS certificate and key paths for VeNCrypt.
+// When both are set, the VNC server offers VeNCrypt TLS encryption.
+var (
+	buildWithTLSCert string
+	buildWithTLSKey  string
+)
 
 // version / buildTime are injected via LDFLAGS -X main.version / -X main.buildTime
 // (see Makefile). Printed at startup so the log line unambiguously identifies
@@ -128,7 +136,7 @@ type TailVNC struct {
 // startServer listens on the embedded Tailscale (tsnet) interface and serves
 // VNC over the WireGuard-encrypted mesh. Used when a Tailscale auth key is
 // configured at build time.
-func (t *TailVNC) startServer(listenPort string, authPass string) error {
+func (t *TailVNC) startServer(listenPort string, authPass string, tlsCfg *tls.Config) error {
 	listener, err := t.server.Listen("tcp", ":"+listenPort)
 	if err != nil {
 		return err
@@ -136,13 +144,13 @@ func (t *TailVNC) startServer(listenPort string, authPass string) error {
 	defer listener.Close()
 
 	log.Printf("VNC server started (tsnet): %s:%s", t.server.Hostname, listenPort)
-	return serve(listener, authPass)
+	return serve(listener, authPass, tlsCfg)
 }
 
 // startDirectServer listens on a plain TCP address (no Tailscale/WireGuard).
 // Used by default when no auth key is embedded, so the binary works as a plain
 // VNC server without any Tailscale dependency.
-func startDirectServer(listenAddr, listenPort, authPass string) error {
+func startDirectServer(listenAddr, listenPort, authPass string, tlsCfg *tls.Config) error {
 	listener, err := net.Listen("tcp", listenAddr+":"+listenPort)
 	if err != nil {
 		return err
@@ -150,13 +158,13 @@ func startDirectServer(listenAddr, listenPort, authPass string) error {
 	defer listener.Close()
 
 	log.Printf("VNC server started (direct TCP): %s:%s", listenAddr, listenPort)
-	return serve(listener, authPass)
+	return serve(listener, authPass, tlsCfg)
 }
 
 // serve is the shared entry point once a listener exists: it picks service vs
 // local mode based on the Windows session the process runs in.
-func serve(listener net.Listener, authPass string) error {
-	srv := &vnc.Server{Password: authPass}
+func serve(listener net.Listener, authPass string, tlsCfg *tls.Config) error {
+	srv := &vnc.Server{Password: authPass, TLSConfig: tlsCfg}
 
 	if vnc.GetCurrentSessionID() == 0 {
 		// Running as SYSTEM in Session 0 (e.g. as a service or via psexec -s).
@@ -230,10 +238,29 @@ func main() {
 		listenAddr = buildWithListenAddr
 	}
 
+	// TLS configuration for VeNCrypt. Load certificate if provided.
+	var tlsCfg *tls.Config
+	tlsCert := flagValue("--tls-cert")
+	tlsKey := flagValue("--tls-key")
+	if tlsCert == "" {
+		tlsCert = buildWithTLSCert
+	}
+	if tlsKey == "" {
+		tlsKey = buildWithTLSKey
+	}
+	if tlsCert != "" && tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+		if err != nil {
+			log.Fatalf("Failed to load TLS key pair: %v", err)
+		}
+		tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}}
+		log.Printf("VeNCrypt TLS enabled (cert: %s)", tlsCert)
+	}
+
 	// No Tailscale auth key: serve VNC over plain TCP without WireGuard.
 	if authKey == "" {
 		log.Printf("Starting direct VNC server on %s as %s", listenAddr+":"+listenPort, hostName)
-		if err := startDirectServer(listenAddr, listenPort, authPass); err != nil {
+		if err := startDirectServer(listenAddr, listenPort, authPass, tlsCfg); err != nil {
 			log.Fatalf("Failed to start server: %v", err)
 		}
 		return
@@ -256,7 +283,7 @@ func main() {
 
 	tailVNC := &TailVNC{server: s}
 
-	if err := tailVNC.startServer(listenPort, authPass); err != nil {
+	if err := tailVNC.startServer(listenPort, authPass, tlsCfg); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
