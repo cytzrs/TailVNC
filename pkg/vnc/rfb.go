@@ -207,14 +207,15 @@ func (s *session) cursorSendLoop() {
 }
 
 // sendServerCutText sends a ServerCutText message (type 3) to the client.
-// Text is encoded as Latin-1 (ISO 8859-1) per the RFB spec.
+// Modern VNC clients (TigerVNC, TightVNC, Remmina) expect UTF-8, not the
+// RFC 6143 Latin-1. Send raw UTF-8 bytes for full Unicode support.
 func (s *session) sendServerCutText(text string) error {
-	latin1 := rfbcore.UTF8ToLatin1(text)
-	buf := make([]byte, 8+len(latin1))
+	utf8 := []byte(text)
+	buf := make([]byte, 8+len(utf8))
 	buf[0] = serverCutText
 	// buf[1..3] = padding (zero)
-	binary.BigEndian.PutUint32(buf[4:8], uint32(len(latin1)))
-	copy(buf[8:], latin1)
+	binary.BigEndian.PutUint32(buf[4:8], uint32(len(utf8)))
+	copy(buf[8:], utf8)
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -828,9 +829,11 @@ func (s *session) handleCutText() error {
 	if _, err := io.ReadFull(s.conn, buf); err != nil {
 		return err
 	}
-	// RFB ClientCutText is Latin-1 encoded; convert to UTF-8 for Windows clipboard.
+	// Modern VNC clients send UTF-8. Go strings are UTF-8, so pass through directly.
+	// For legacy Latin-1-only clients, the bytes still work because Latin-1 < 0x80
+	// is identical to UTF-8.
 	if s.clipBoard != nil && length > 0 {
-		s.clipBoard.SetText(rfbcore.Latin1ToUTF8(buf))
+		s.clipBoard.SetText(string(buf))
 	}
 	return nil
 }
