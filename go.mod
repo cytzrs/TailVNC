@@ -3,6 +3,7 @@ module tailvnc
 go 1.25.3
 
 require (
+	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55
 	golang.org/x/sys v0.42.0
 	tailscale.com v1.92.0
 )
@@ -33,7 +34,6 @@ require (
 	github.com/prometheus-community/pro-bing v0.4.0 // indirect
 	github.com/safchain/ethtool v0.3.0 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20231202035212-d3fa0460f47e // indirect
-	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
 	github.com/tailscale/goupnp v1.0.1-0.20210804011211-c64d0f06ea05 // indirect
 	github.com/tailscale/hujson v0.0.0-20221223112325-20486734a56a // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect

@@ -115,7 +115,7 @@ func spawnAgentInSession(sessionID uint32, port string) (windows.Handle, []byte,
 		return 0, nil, fmt.Errorf("SEC-4: %w", err)
 	}
 
-	cmdLine := `"` + exePath + `" --agent ` + port
+	cmdLine := `"` + exePath + `" --agent pipe`
 	cmdLineW, err := windows.UTF16PtrFromString(cmdLine)
 	if err != nil {
 		return 0, nil, err

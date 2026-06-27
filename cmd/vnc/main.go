@@ -14,6 +14,7 @@ import (
 	"tailvnc/pkg/utils"
 	"tailvnc/pkg/vnc"
 
+	winio "github.com/tailscale/go-winio"
 	"tailscale.com/tsnet"
 )
 
@@ -81,22 +82,31 @@ func agentPort() string {
 	return flagValue("--agent")
 }
 
-// runAgent runs a local VNC server on 127.0.0.1:<port>.
+// runAgent runs a local VNC server on a Windows Named Pipe.
 // Called when the process is spawned as a user-session agent by the service.
 // Screen capture and input injection work correctly here because the process
 // is running inside the interactive user session (not Session 0 / SYSTEM).
-func runAgent(port string) {
+func runAgent(_ string) {
 	// setupFileLog(`C:\Windows\Temp\tailvnc-agent.log`)
-	log.Printf("[agent] starting on 127.0.0.1:%s", port)
+	log.Printf("[agent] starting on named pipe %s", vnc.AgentPipeName)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	// Create a security descriptor that allows only SYSTEM and
+	// Administrators to connect to the pipe.
+	pipeConfig := &winio.PipeConfig{
+		SecurityDescriptor: "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+		MessageMode:        false,
+		InputBufferSize:    65536,
+		OutputBufferSize:   65536,
+	}
+
+	ln, err := winio.ListenPipe(vnc.AgentPipeName, pipeConfig)
 	if err != nil {
-		log.Fatalf("[agent] listen: %v", err)
+		log.Fatalf("[agent] ListenPipe: %v", err)
 	}
 	defer ln.Close()
 
 	// SEC-2: if spawned by the service, require the one-time IPC token on this
-	// loopback listener so a non-authorized local process cannot seize the
+	// pipe listener so a non-authorized local process cannot seize the
 	// desktop without the VNC password.
 	if tokHex := os.Getenv("TAILVNC_AGENT_TOKEN"); tokHex != "" {
 		tok, err := hex.DecodeString(tokHex)

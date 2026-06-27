@@ -7,29 +7,37 @@ import (
 	"log"
 	"net"
 	"time"
+
+	winio "github.com/tailscale/go-winio"
 )
 
-// proxyToAgent connects to the local agent VNC server and bidirectionally
-// proxies bytes between the remote VNC client and the agent.
-// Retries for up to 10 seconds to give the agent time to start.
-// If token is non-empty it is written first (SEC-2): the agent's loopback
-// listener drops connections that do not present it.
-func proxyToAgent(client net.Conn, port string, token []byte) {
-	defer client.Close()
+// AgentPipeName is the fixed Windows Named Pipe path used for service→agent IPC.
+// Using a named pipe instead of TCP loopback eliminates network-stack overhead
+// and allows kernel-level ACL control (only SYSTEM and Administrators can connect).
+const AgentPipeName = `\\.\pipe\TailVNC_Agent`
 
-	addr := "127.0.0.1:" + port
+// agentPipeName is retained as an alias for internal use within the vnc package.
+const agentPipeName = AgentPipeName
+
+// proxyToAgent connects to the local agent VNC server via a Windows Named Pipe
+// and bidirectionally proxies bytes between the remote VNC client and the agent.
+// Retries for up to 10 seconds to give the agent time to start.
+// If token is non-empty it is written first (SEC-2): the agent's pipe
+// listener drops connections that do not present it.
+func proxyToAgent(client net.Conn, _ string, token []byte) {
+	defer client.Close()
 
 	var agentConn net.Conn
 	var err error
 	for i := 0; i < 50; i++ {
-		agentConn, err = net.DialTimeout("tcp", addr, time.Second)
+		agentConn, err = winio.DialPipe(agentPipeName, nil)
 		if err == nil {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	if err != nil {
-		log.Printf("[proxy] %s: cannot reach agent at %s: %v", client.RemoteAddr(), addr, err)
+		log.Printf("[proxy] %s: cannot reach agent pipe %s: %v", client.RemoteAddr(), agentPipeName, err)
 		return
 	}
 	defer agentConn.Close()
@@ -44,7 +52,7 @@ func proxyToAgent(client net.Conn, port string, token []byte) {
 		_ = agentConn.SetWriteDeadline(time.Time{})
 	}
 
-	log.Printf("[proxy] %s ↔ agent:%s", client.RemoteAddr(), port)
+	log.Printf("[proxy] %s ↔ agent pipe", client.RemoteAddr())
 
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
