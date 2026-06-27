@@ -177,68 +177,127 @@ func (st *inputState) buttonEvent(buttonMask uint8, x, y, screenW, screenH int) 
 }
 
 // keysym2VK maps X11 KeySyms used by RFB to Windows virtual-key codes.
+// Uses a pre-built table (keysymTable) populated at init time with
+// layout-aware mappings via VkKeyScanExW + MapVirtualKeyW. Falls back to
+// a dynamic VkKeyScanExW call for Latin-1 characters not in the table.
 func keysym2VK(keysym uint32) (vk uint16, scan uint16, extended bool) {
-	// Latin-1 printable
-	if keysym >= 0x20 && keysym <= 0x7e {
-		r, _, _ := procVkKeyScanA.Call(uintptr(keysym))
-		vk = uint16(r & 0xff)
-		return
+	if m, ok := keysymTable[keysym]; ok {
+		return m.vk, m.scan, m.extended
 	}
-	// Function keys
-	if keysym >= 0xffbe && keysym <= 0xffc9 {
-		vk = uint16(0x70 + keysym - 0xffbe)
-		return
-	}
-	switch keysym {
-	case 0xff08:
-		vk = 0x08 // Backspace
-	case 0xff09:
-		vk = 0x09 // Tab
-	case 0xff0d:
-		vk = 0x0d // Return
-	case 0xff1b:
-		vk = 0x1b // Escape
-	case 0xff63:
-		vk, extended = 0x2d, true // Insert
-	case 0xff9f, 0xffff:
-		vk, extended = 0x2e, true // Delete
-	case 0xff50:
-		vk, extended = 0x24, true // Home
-	case 0xff57:
-		vk, extended = 0x23, true // End
-	case 0xff55:
-		vk, extended = 0x21, true // PageUp
-	case 0xff56:
-		vk, extended = 0x22, true // PageDown
-	case 0xff51:
-		vk, extended = 0x25, true // Left
-	case 0xff52:
-		vk, extended = 0x26, true // Up
-	case 0xff53:
-		vk, extended = 0x27, true // Right
-	case 0xff54:
-		vk, extended = 0x28, true // Down
-	case 0xffe1, 0xffe2:
-		vk = 0x10 // Shift
-	case 0xffe3, 0xffe4:
-		vk = 0x11 // Control
-	case 0xffe7, 0xffe8:
-		vk = 0x12 // Alt/Meta
-	case 0xffe9, 0xffea:
-		vk = 0x12 // Alt
-	case 0xff20:
-		vk = 0x14 // Caps Lock
-	case 0xff61:
-		vk = 0x2c // PrintScreen
-	case 0xff13:
-		vk = 0x13 // Pause
-	case 0xff14:
-		vk = 0x91 // ScrollLock
+	// Dynamic fallback for Latin-1 chars not cached at init.
+	if keysym >= 0x20 && keysym <= 0xff {
+		hkl, _, _ := procGetKeyboardLayout.Call(0)
+		r, _, _ := procVkKeyScanExW.Call(uintptr(keysym), hkl)
+		if r != 0xFFFFFFFF && r&0xFF != 0xFF {
+			vk = uint16(r & 0xFF)
+			sc, _, _ := procMapVirtualKeyW.Call(uintptr(vk), mapvkVkToVsc)
+			return vk, uint16(sc), false
+		}
 	}
 	return
 }
 
-var procVkKeyScanA = user32.NewProc("VkKeyScanA")
+var (
+	procVkKeyScanExW    = user32.NewProc("VkKeyScanExW")
+	procMapVirtualKeyW  = user32.NewProc("MapVirtualKeyW")
+	procGetKeyboardLayout = user32.NewProc("GetKeyboardLayout")
+)
+
+const (
+	mapvkVkToVsc = 0 // MAPVK_VK_TO_VSC
+	mapvkVkToChar = 2 // MAPVK_VK_TO_CHAR
+)
+
+// keyMapping holds the Windows VK code, scan code, and extended flag for an
+// X11 keysym.
+type keyMapping struct {
+	vk       uint16
+	scan     uint16
+	extended bool
+}
+
+// keysymTable maps X11 KeySyms to Windows virtual-key codes. Built once at
+// init from the hardcoded X11→VK table (control/edit/function/movement keys)
+// plus a dynamic Latin-1 range via VkKeyScanExW for the current keyboard layout.
+var keysymTable map[uint32]keyMapping
+
+// staticKeysymMap contains the fixed X11→VK mappings that do not depend on
+// keyboard layout. These cover control keys, navigation keys, function keys,
+// and modifiers — all of which have well-defined VK codes regardless of layout.
+var staticKeysymMap = map[uint32]keyMapping{
+	// Edit keys
+	0xff08: {0x08, 0, false}, // Backspace
+	0xff09: {0x09, 0, false}, // Tab
+	0xff0d: {0x0d, 0, false}, // Return
+	0xff1b: {0x1b, 0, false}, // Escape
+	0xff63: {0x2d, 0, true},  // Insert
+	0xff9f: {0x2e, 0, true},  // Delete (KP_Delete)
+	0xffff: {0x2e, 0, true},  // Delete
+
+	// Navigation keys (all extended)
+	0xff50: {0x24, 0, true}, // Home
+	0xff57: {0x23, 0, true}, // End
+	0xff55: {0x21, 0, true}, // PageUp
+	0xff56: {0x22, 0, true}, // PageDown
+	0xff51: {0x25, 0, true}, // Left
+	0xff52: {0x26, 0, true}, // Up
+	0xff53: {0x27, 0, true}, // Right
+	0xff54: {0x28, 0, true}, // Down
+
+	// Modifiers
+	0xffe1: {0x10, 0, false}, // Left Shift
+	0xffe2: {0x10, 0, false}, // Right Shift
+	0xffe3: {0x11, 0, false}, // Left Control
+	0xffe4: {0x11, 0, false}, // Right Control
+	0xffe7: {0x12, 0, false}, // Left Meta (Alt)
+	0xffe8: {0x12, 0, false}, // Right Meta (Alt)
+	0xffe9: {0x12, 0, false}, // Left Alt
+	0xffea: {0x12, 0, false}, // Right Alt
+
+	// Lock/special keys
+	0xff20: {0x14, 0, false}, // Caps Lock
+	0xff61: {0x2c, 0, false}, // PrintScreen
+	0xff13: {0x13, 0, false}, // Pause
+	0xff14: {0x91, 0, false}, // ScrollLock
+
+	// NumLock
+	0xff7f: {0x90, 0, false},
+
+	// Space
+	0x020: {0x20, 0, false},
+}
+
+func init() {
+	keysymTable = make(map[uint32]keyMapping, len(staticKeysymMap)+95)
+
+	// Copy static mappings and resolve scan codes via MapVirtualKeyW.
+	for ks, m := range staticKeysymMap {
+		if m.scan == 0 {
+			sc, _, _ := procMapVirtualKeyW.Call(uintptr(m.vk), mapvkVkToVsc)
+			m.scan = uint16(sc)
+		}
+		keysymTable[ks] = m
+	}
+
+	// Function keys F1–F12 (0xffbe–0xffc9 → VK_F1–VK_F12 = 0x70–0x7B).
+	for i := uint32(0); i < 12; i++ {
+		vk := uint16(0x70 + i)
+		sc, _, _ := procMapVirtualKeyW.Call(uintptr(vk), mapvkVkToVsc)
+		keysymTable[0xffbe+i] = keyMapping{vk: vk, scan: uint16(sc)}
+	}
+
+	// Latin-1 printable range (0x21–0x7e): use VkKeyScanExW for layout-aware
+	// mapping. Skip 0x20 (space, handled in static table).
+	hkl, _, _ := procGetKeyboardLayout.Call(0)
+	for ch := uint32(0x21); ch <= 0x7e; ch++ {
+		r, _, _ := procVkKeyScanExW.Call(uintptr(ch), hkl)
+		if r != 0xFFFFFFFF && r&0xFF != 0xFF {
+			vk := uint16(r & 0xFF)
+			sc, _, _ := procMapVirtualKeyW.Call(uintptr(vk), mapvkVkToVsc)
+			keysymTable[ch] = keyMapping{vk: vk, scan: uint16(sc)}
+		}
+	}
+}
 
 // sendSAS signals the service process (session 0) to call SendSAS(FALSE).
 // SendSAS only works when called from session 0; the agent runs in session 1,
