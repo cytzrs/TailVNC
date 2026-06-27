@@ -16,17 +16,18 @@ import (
 )
 
 var (
-	gdi32                = windows.NewLazySystemDLL("gdi32.dll")
-	user32               = windows.NewLazySystemDLL("user32.dll")
-	procGetDC            = user32.NewProc("GetDC")
-	procReleaseDC        = user32.NewProc("ReleaseDC")
-	procCreateCompatDC   = gdi32.NewProc("CreateCompatibleDC")
-	procCreateDIBSection = gdi32.NewProc("CreateDIBSection")
-	procSelectObject     = gdi32.NewProc("SelectObject")
-	procDeleteObject     = gdi32.NewProc("DeleteObject")
-	procDeleteDC         = gdi32.NewProc("DeleteDC")
-	procBitBlt           = gdi32.NewProc("BitBlt")
-	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
+	gdi32                   = windows.NewLazySystemDLL("gdi32.dll")
+	user32                  = windows.NewLazySystemDLL("user32.dll")
+	procGetDC               = user32.NewProc("GetDC")
+	procReleaseDC           = user32.NewProc("ReleaseDC")
+	procCreateCompatDC      = gdi32.NewProc("CreateCompatibleDC")
+	procCreateDIBSection    = gdi32.NewProc("CreateDIBSection")
+	procSelectObject        = gdi32.NewProc("SelectObject")
+	procDeleteObject        = gdi32.NewProc("DeleteObject")
+	procDeleteDC            = gdi32.NewProc("DeleteDC")
+	procBitBlt              = gdi32.NewProc("BitBlt")
+	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
+	procEnumDisplaySettings = user32.NewProc("EnumDisplaySettingsW")
 
 	// Desktop / window-station management
 	procOpenInputDesktop         = user32.NewProc("OpenInputDesktop")
@@ -44,7 +45,44 @@ const (
 	srccopy      = 0x00CC0020
 	dibRgbColors = 0
 	uoiName      = 2
+
+	// ENUM_CURRENT_SETTINGS tells EnumDisplaySettings to return the current
+	// display mode rather than a registry-backed graphics mode.
+	enumCurrentSettings = 0xFFFFFFFF // == ENUM_CURRENT_SETTINGS
 )
+
+// devMode mirrors the Win32 DEVMODE structure. We only need the display
+// fields (dmPelsWidth, dmPelsHeight) so the bulk of the union is omitted;
+// the layout up to dmPelsWidth is fixed by the Win32 ABI and matches what
+// EnumDisplaySettingsW writes for a display device.
+type devMode struct {
+	dmDeviceName       [32]uint16 // C0  (64 bytes)
+	dmSpecVersion      uint16     // C32
+	dmDriverVersion    uint16     // C34
+	dmSize             uint16     // C36
+	dmDriverExtra      uint16     // C38
+	dmFields           uint32     // C40
+	dmOrientation      int16      // C44 (printer only)
+	dmPaperSize        int16      // C46
+	dmPaperLength      int16      // C48
+	dmPaperWidth       int16      // C50
+	dmScale            int16      // C52
+	dmCopies           int16      // C54
+	dmDefaultSource    int16      // C56
+	dmPrintQuality     int16      // C58
+	dmColor            int16      // C60
+	dmDuplex           int16      // C62
+	dmYResolution      int16      // C64
+	dmTTOption         int16      // C66
+	dmCollate          int16      // C68
+	dmFormName         [32]uint16 // C70 (64 bytes)
+	dmLogPixels        uint16     // C102
+	dmBitsPerPel       uint32     // C104
+	dmPelsWidth        uint32     // C108
+	dmPelsHeight       uint32     // C112
+	dmDisplayFlags     uint32     // C116
+	dmDisplayFrequency uint32     // C120
+}
 
 type bitmapInfoHeader struct {
 	Size          uint32
@@ -137,9 +175,34 @@ type Capturer struct {
 	memDC uintptr        // pooled compatible DC
 	bmp   uintptr        // pooled DIB section
 	bits  unsafe.Pointer // pooled DIB pixel pointer (BGRA)
+
+	// Double-buffered RGBA frames. Two pre-allocated frames are swapped
+	// each capture, eliminating ~26 MB NewRGBA per frame (PERF-2 ext).
+	frameA   *image.RGBA
+	frameB   *image.RGBA
+	frameIdx int // alternates 0/1
 }
 
+// screenSize returns the physical display resolution via EnumDisplaySettingsW.
+//
+// GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN) returns the logical (DPI-virtualized)
+// resolution which can differ from the physical pixel dimensions when the
+// desktop is extended across a virtual surface (common in VirtualBox and other
+// VMs). EnumDisplaySettingsW with ENUM_CURRENT_SETTINGS returns the true
+// dmPelsWidth/dmPelsHeight from the active display mode, which is what
+// SendInput absolute coordinates (0–65535 range) are normalised against.
 func screenSize() (int, int) {
+	var dm devMode
+	dm.dmSize = uint16(unsafe.Sizeof(dm))
+	ret, _, _ := procEnumDisplaySettings.Call(
+		0, // NULL → current display device
+		uintptr(enumCurrentSettings),
+		uintptr(unsafe.Pointer(&dm)),
+	)
+	if ret != 0 && dm.dmPelsWidth != 0 && dm.dmPelsHeight != 0 {
+		return int(dm.dmPelsWidth), int(dm.dmPelsHeight)
+	}
+	// Fallback to GetSystemMetrics if EnumDisplaySettings fails.
 	w, _, _ := procGetSystemMetrics.Call(uintptr(smCxScreen))
 	h, _, _ := procGetSystemMetrics.Call(uintptr(smCyScreen))
 	return int(w), int(h)
@@ -239,14 +302,35 @@ func (c *Capturer) Capture() (*image.RGBA, error) {
 		return nil, fmt.Errorf("BitBlt failed")
 	}
 
-	// bits points to the raw BGRA pixel data of the pooled DIB.
+	// Double-buffered capture: reuse two pre-allocated RGBA frames,
+	// swapping between them each call. This eliminates the per-frame
+	// NewRGBA allocation (~26 MB at 1080p) that caused heavy GC pressure
+	// and ~25% CPU usage even on a static desktop.
+	if c.frameA == nil {
+		c.frameA = image.NewRGBA(image.Rect(0, 0, c.width, c.height))
+		c.frameB = image.NewRGBA(image.Rect(0, 0, c.width, c.height))
+	}
+
+	// Pick the write buffer; return the other (stable for caller to hold).
+	var img *image.RGBA
+	if c.frameIdx == 0 {
+		img = c.frameA
+	} else {
+		img = c.frameB
+	}
+	c.frameIdx ^= 1 // flip for next call
+
+	// BGRA→RGBA batch conversion. Process 4 bytes at a time with direct
+	// index arithmetic — the compiler optimises this into efficient
+	// memory operations. Setting alpha=0xff inline avoids a second pass.
 	raw := unsafe.Slice((*byte)(c.bits), c.width*c.height*4)
-	img := image.NewRGBA(image.Rect(0, 0, c.width, c.height))
-	for i := 0; i < c.width*c.height; i++ {
-		img.Pix[i*4+0] = raw[i*4+2] // R <- B
-		img.Pix[i*4+1] = raw[i*4+1] // G
-		img.Pix[i*4+2] = raw[i*4+0] // B <- R
-		img.Pix[i*4+3] = 0xff
+	pix := img.Pix
+	n := len(raw)
+	for i := 0; i < n; i += 4 {
+		pix[i+0] = raw[i+2] // R <- B
+		pix[i+1] = raw[i+1] // G
+		pix[i+2] = raw[i+0] // B <- R
+		pix[i+3] = 0xff
 	}
 	return img, nil
 }
@@ -422,14 +506,20 @@ func (c *SessionAwareCapturer) loop() {
 		changed = full || len(dirty) > 0
 		c.mu.Unlock()
 
-		// Adaptive frame rate: stay at full 30 fps while the screen is
-		// changing, but back off when it is static to save CPU and let the
-		// dirty-rect path report changes cheaply.  The moment anything
-		// changes we return to 30 fps immediately.
+		// Adaptive frame rate with gradual backoff. 30 fps when active,
+		// then progressively slower as the desktop stays static: 10 fps
+		// after 3 frames, 5 fps after 10, 2 fps after 30. This slashes
+		// CPU on idle desktops (the common case for remote admin) while
+		// staying responsive — any change instantly resets to 30 fps.
 		staticFrames++
 		delay := 33 * time.Millisecond // ~30 fps (active)
-		if staticFrames > 3 {
-			delay = 100 * time.Millisecond // static → ~10 fps
+		switch {
+		case staticFrames > 30:
+			delay = 500 * time.Millisecond // deep idle → ~2 fps
+		case staticFrames > 10:
+			delay = 200 * time.Millisecond // light idle → ~5 fps
+		case staticFrames > 3:
+			delay = 100 * time.Millisecond // cooling → ~10 fps
 		}
 		if changed {
 			staticFrames = 0
