@@ -300,6 +300,10 @@ func (s *Server) serveVNC(ln net.Listener, capturer ScreenCapturer, input InputI
 			log.Printf("accept: %v", err)
 			continue
 		}
+		// Signal the capturer that a client connected (wakes idle capture loop).
+		if sc, ok := capturer.(interface{ AddClient() }); ok {
+			sc.AddClient()
+		}
 		sess := &session{
 			conn:      conn,
 			capturer:  capturer,
@@ -310,6 +314,11 @@ func (s *Server) serveVNC(ln net.Listener, capturer ScreenCapturer, input InputI
 			password:  s.Password,
 			tlsConfig: s.TLSConfig,
 		}
-		go sess.Serve()
+		go func() {
+			sess.Serve()
+			if sc, ok := capturer.(interface{ RemoveClient() }); ok {
+				sc.RemoveClient()
+			}
+		}()
 	}
 }

@@ -6,3 +6,4 @@
 # Build artifacts
 dist/
 *.exe
+.codebase-memory/
