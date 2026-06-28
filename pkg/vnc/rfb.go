@@ -198,11 +198,20 @@ func (s *session) cursorSendLoop() {
 		if !shot.changed || shot.img == nil {
 			continue
 		}
-		buf := rfbcore.EncodeCursorPseudoRect(shot.x, shot.y,
+		rect := rfbcore.EncodeCursorPseudoRect(shot.x, shot.y,
 			shot.img.Bounds().Dx(), shot.img.Bounds().Dy(),
 			shot.hotX, shot.hotY, s.pixelFormat(), shot.img)
+		// Wrap the rect in a FramebufferUpdate message:
+		//   uint8 messageType = 0 (FramebufferUpdate)
+		//   uint8 padding = 0
+		//   uint16 numRects = 1
+		msg := make([]byte, 4+len(rect))
+		msg[0] = serverFramebufferUpdate
+		msg[1] = 0
+		binary.BigEndian.PutUint16(msg[2:4], 1)
+		copy(msg[4:], rect)
 		s.writeMu.Lock()
-		_, err := s.conn.Write(buf)
+		_, err := s.conn.Write(msg)
 		s.writeMu.Unlock()
 		if err != nil {
 			return
